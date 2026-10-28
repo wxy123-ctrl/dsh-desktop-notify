@@ -1,0 +1,42 @@
+{
+  "name": "dsh-desktop-notify",
+  "version": "1.1.0",
+  "type": "module",
+  "description": "DSH 桌面通知：会话完成、等待审批/提问/计划确认或出错时弹出 Windows 原生通知，点击通知跳回对应会话，支持按会话静音。",
+  "license": "MIT",
+  "author": "wxy123-ctrl",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wxy123-ctrl/dsh-desktop-notify.git"
+  },
+  "homepage": "https://github.com/wxy123-ctrl/dsh-desktop-notify#readme",
+  "bugs": "https://github.com/wxy123-ctrl/dsh-desktop-notify/issues",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "desktop-notification",
+    "windows-toast",
+    "notifyicon"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}
