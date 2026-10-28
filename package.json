@@ -1,8 +1,18 @@
 {
   "name": "dsh-desktop-notify",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "type": "module",
   "description": "DSH 桌面通知：会话完成、等待审批/提问/计划确认或出错时弹出 Windows 原生通知，点击通知跳回对应会话，支持按会话静音。",
+  "icon": "./icon.svg",
+  "files": [
+    "index.js",
+    "client.js",
+    "toast-notify.ps1",
+    "selftest.mjs",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
   "license": "MIT",
   "author": "wxy123-ctrl",
   "repository": {

@@ -89,6 +89,7 @@ React commit 生灭）。
 | `cordis.patch.yml` | bundle 补丁：`insert` 行 `{id: desktop-notify, name: dsh-desktop-notify}` |
 | `selftest.mjs` | 自测：`node selftest.mjs`（99 项断言，无 UI 依赖，含真子进程退出码端到端） |
 | `locale/zh.json` `locale/en.json` | 插件页（设置 → 内置插件）卡片的中英文标题与描述（`meta.title` / `meta.description`） |
+| `icon.svg` | 插件页卡片图标（package.json 顶层 `icon` 字段声明） |
 
 ## 启用流程（desktop profile）
 
