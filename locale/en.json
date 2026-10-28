@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Desktop Notify",
+    "description": "Desktop notifications for the DSH desktop app: a native Windows toast when a turn completes, when approval or a question is pending, or on errors; clicking the toast jumps back to the session, with per-session mute."
+  }
+}
