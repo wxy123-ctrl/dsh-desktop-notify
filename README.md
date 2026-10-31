@@ -25,7 +25,7 @@ web profile 验证多年的同通道），点击跳转保持桌面原生：
 ```
 宿主半边 index.js（desktop profile 内，纯 Node）
   5 类事件 → 静音门控 + 2.5s 防抖（文案/标题与 sysnotify 相同）
-  →【delivery: powershell（默认）】spawn powershell -File toast-notify.ps1
+  →【delivery: powershell（默认）】spawn powershell/pwsh -File toast-notify.ps1
     -Title -Body（U+2028 载体换行）-SessionId -ClickToken -ClickUrl
   →【delivery: 'renderer'（预留）】入队 type:'notify' 事件 → 页面长轮询 →
     client.js new Notification()（未来桌面端补上 AUMID 后启用）
@@ -53,7 +53,42 @@ web profile 验证多年的同通道），点击跳转保持桌面原生：
 | waterfall 任何路径 `return next()` | 不调用会否决链条，dsh-tools 崩（2026-08 事故） |
 | 路由守卫「Origin 缺席放行」 | 桌面壳转发删除 Origin 头；sysnotify 严格守卫会 403 桌面请求 |
 
-## 审批事件的两条来源（v1.1.2 未发布修订）
+## 通知用哪个 PowerShell：5.1 vs 7（v1.2.0）
+
+气泡脚本只用两版公共语法（WinForms NotifyIcon、P/Invoke、HttpWebRequest），
+`powershell.exe`（5.1）与 `pwsh.exe`（7）**功能完全等价**（已在 7.6 实测：
+脚本 0 语法错误、WinForms/SystemIcons 正常加载）。差异在选择哪个：
+
+| 维度 | powershell.exe 5.1（默认） | pwsh.exe 7 |
+|---|---|---|
+| 可用性 | 每台 Windows 必有 | 需另行安装（MSI / Microsoft Store） |
+| 启动（每条通知 spawn 一次） | ~200–400ms | ~400–900ms（自载 .NET；Store 版别名再略慢） |
+| 无 BOM 的 UTF-8 脚本 | 按 GBK 误读 → 崩（本插件 BOM 纪律的由来） | 默认 UTF-8（本插件仍带 BOM，两版兼容） |
+| 运行时 | 冻结，仅维护 | 活跃演进（三元、`??`、并行等备用） |
+| 适合谁 | 市场分发——别人机器零依赖 | 想与 DSH 自身用壳一致 / 偏好新运行时 |
+
+切换（profile 的 `cordis.patch.yml`，与 `delivery` 同一覆盖机制）：
+
+```yaml
+- id: desktop-notify
+  config:
+    shell: pwsh       # 默认 powershell；'auto' = pwsh 优先、回落静默
+```
+
+解析在**加载期一次完成**：`where.exe pwsh` 定位 → 启动存活探针
+（`-NoProfile -Command exit 0`，5s 超时）——找不到或起不来（如 Store 版别名
+失效、pwsh 被卸载）**一律回落 powershell.exe**，通知不灭。`desktop-notify.log`
+加载行即判据：
+
+- `shell pwsh @ C:\…\pwsh.exe`（用上了 pwsh）
+- `shell powershell.exe（pwsh 未找到，已回落）` / `（pwsh 探针失败，已回落）`
+- `shell powershell.exe`（默认）
+
+运行中 pwsh 被卸载：该次 spawn 记 `toast spawn 失败`（既有日志兜底），下次
+重启宿主自动回落。另：通知中心的归组名会随所用 exe 变化（5.1 显示
+Windows PowerShell；7 显示 PowerShell）。
+
+## 审批事件的两条来源（v1.2.0）
 
 「等待批准」通知有**两条来源**，缺一不可：
 
@@ -103,7 +138,7 @@ React commit 生灭）。
 | `desktop-notify.log` | 诊断日志（加载 / spawn / 入队 / 投递唤醒 / 点击双通道 / 路由异常，无条件落盘） |
 | `package.json` | `dsh.bundle.patch` 声明 bundle 补丁，`dsh.client` 声明浏览器半边 |
 | `cordis.patch.yml` | bundle 补丁：`insert` 行 `{id: desktop-notify, name: dsh-desktop-notify}` |
-| `selftest.mjs` | 自测：`node selftest.mjs`（108 项断言，无 UI 依赖，含真子进程退出码端到端） |
+| `selftest.mjs` | 自测：`node selftest.mjs`（120 项断言，无 UI 依赖，含真子进程退出码端到端） |
 | `locale/zh.json` `locale/en.json` | 插件页（设置 → 内置插件）卡片的中英文标题与描述（`meta.title` / `meta.description`） |
 | `icon.svg` | 插件页卡片图标（package.json 顶层 `icon` 字段声明） |
 
@@ -137,16 +172,19 @@ React commit 生灭）。
 
 ## 排障（按投递链三环）
 
-1. **宿主环**：`desktop-notify.log` 应有「插件已加载（v1.1.0，投递
-   powershell…）」；触发事件后有 `notify kind=… spawn toast` 行。没有 →
-   事件未到或宿主半边未加载（确认 bundle 注册 + 已重启桌面端）。
+1. **宿主环**：`desktop-notify.log` 应有「插件已加载（v1.2.0，投递
+   powershell，shell …，静音 N 个会话）」；触发事件后有 `notify kind=…
+   spawn toast` 行。没有 → 事件未到或宿主半边未加载（确认 bundle 注册 +
+   已重启桌面端）。shell 段显示「已回落」→ config.shell 指向的 pwsh
+   不可用（未装/别名失效），已自动用 5.1 兜底，通知不受影响。
 2. **气泡环**：log 出现 `toast 进程退出码 N`（N≠3）→ PS 脚本执行失败
-   （检查 BOM / 安全软件拦截记录）；`toast spawn 失败` → 无 powershell。
+   （检查 BOM / 安全软件拦截记录）；`toast spawn 失败` → 所选 shell
+   可执行文件起不来（pwsh 运行中被卸载等，重启宿主自动回落）。
 3. **点击环**：点击气泡后 log 应有 `notify-click HTTP 信号 sid=…`（或
    `toast 点击（退出码通道）sid=…` 兜底）+ `notify-events 点击投递 …唤醒 1 个
    等待请求`；桌面端 DevTools 控制台 `[dsh-desktop-notify] 事件到达 click
    <sid>`。窗口没切 → 对比控制台有无 `openSession 失败` 警告；页面轮询死 →
-   确认横幅 `[dsh-desktop-notify] v1.1.0 事件长轮询已启动` 存在，刷新窗口一次。
+   确认横幅 `[dsh-desktop-notify] v1.2.0 事件长轮询已启动` 存在，刷新窗口一次。
 
 ## 已知边界
 

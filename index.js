@@ -32,6 +32,10 @@
 //     param() 解析崩、静默失败；selftest 有 BOM 断言）
 //   · spawn 只用 {stdio:'ignore'}——detached/windowsHide 会让 NotifyIcon
 //     气泡消失（DETACHED_PROCESS 迫使子进程新建隐藏控制台，实测致命）
+//   · 通知进程默认 powershell.exe（每台 Windows 必有，市场分发零依赖）；
+//     config.shell 'pwsh' / 'auto' 切 pwsh 7——where.exe 定位 + 启动存活
+//     探针，找不到/起不来一律回落 powershell.exe（toast-notify.ps1 两个
+//     版本语法兼容，带 BOM，两版都要求明文 -File 调用）
 //
 // ⚠️ 路由同源守卫与 sysnotify 不同：桌面壳把 dsh-app://app 页面的请求经
 // protocol.handle 转发给宿主 HTTP 时会【删除 Origin 头】（壳持有认证 cookie，
@@ -56,9 +60,9 @@
 // notify-prefs.json（{"muted":[sessionId…]}，缺席 = 开启，默认开启），notify()
 // 单点门控——静音会话的全部 5 类通知都不投递。
 
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -123,6 +127,66 @@ const pendingToasts = new Map()
  *  PS 点击只聚焦窗口不发信号（页面轮询通道不可用时的退化行为）。 */
 let clickUrl = ''
 
+/** 通知进程：apply() 时经 pickShell() 解析（默认 'powershell.exe'）。 */
+let toastShell = 'powershell.exe'
+
+/** where.exe 定位 pwsh（取首个非空行，须真实存在；WindowsApps 执行别名
+ *  是 0 字节重解析点，existsSync 为真，能否启动交给存活探针判定）。 */
+function wherePwsh() {
+  try {
+    const r = spawnSync('where.exe', ['pwsh'], { timeout: 5000, windowsHide: true })
+    if (r.error || r.status !== 0) return null
+    const line = String(r.stdout ?? '')
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .find((s) => s !== '')
+    return line && existsSync(line) ? line : null
+  } catch {
+    return null
+  }
+}
+
+/** pwsh 启动存活探针：Store 版别名失效（卸载/损坏）时 spawnSync 报错或
+ *  起不来——这种 pwsh 一条通知都弹不出，必须当场回落 5.1。 */
+function pwshAlive(path) {
+  try {
+    const r = spawnSync(path, ['-NoProfile', '-Command', 'exit 0'], {
+      timeout: 5000,
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+    return !(r.error || r.status !== 0)
+  } catch {
+    return false
+  }
+}
+
+/** 解析通知进程：'powershell'（默认/非法值）→ powershell.exe；'pwsh' /
+ *  'auto' → 探测 pwsh，找不到（pwsh-not-found）或起不来（pwsh-probe-
+ *  failed）一律回落 powershell.exe。probe / liveness 可注入（selftest）。
+ *  返回 { shell, via }，via 供诊断日志区分「用了 pwsh」与「回落」。 */
+export function pickShell(shellConfig, probe = wherePwsh, liveness = pwshAlive) {
+  if (shellConfig !== 'pwsh' && shellConfig !== 'auto') {
+    return { shell: 'powershell.exe', via: 'default' }
+  }
+  const path = probe()
+  if (typeof path !== 'string' || path === '') {
+    return { shell: 'powershell.exe', via: 'pwsh-not-found' }
+  }
+  if (!liveness(path)) {
+    return { shell: 'powershell.exe', via: 'pwsh-probe-failed' }
+  }
+  return { shell: path, via: 'pwsh' }
+}
+
+/** 加载诊断行里的 shell 描述（selftest 断言判据）。 */
+export function shellText(pick) {
+  if (pick.via === 'pwsh') return 'pwsh @ ' + pick.shell
+  if (pick.via === 'pwsh-not-found') return 'powershell.exe（pwsh 未找到，已回落）'
+  if (pick.via === 'pwsh-probe-failed') return 'powershell.exe（pwsh 探针失败，已回落）'
+  return 'powershell.exe'
+}
+
 /** 弹出一条系统通知：明文 -File + 具名参数；命令行与参数经 CreateProcessW
  *  以 UTF-16 传递，中文无代码页问题。⚠️ spawn 选项只能是 {stdio:'ignore'}——
  *  加 detached/windowsHide 后 NotifyIcon 气泡不显示（DETACHED_PROCESS 迫使
@@ -146,7 +210,7 @@ function toast(title, body, sessionId) {
       // 不需要——它们正是用来验证退出码兜底通道的）。
       args.push('-SessionId', sid, '-ClickToken', token, '-ClickUrl', clickUrl)
     }
-    const child = spawn('powershell.exe', args, { stdio: 'ignore' })
+    const child = spawn(toastShell, args, { stdio: 'ignore' })
     if (sid !== '') pendingToasts.set(child, { sid, token })
     const forget = () => pendingToasts.delete(child)
     child.on('error', (e) => {
@@ -269,6 +333,11 @@ export function apply(ctx, config = {}) {
   // 在当前桌面端构建被 Windows 静默丢弃，见文件头）/ 'renderer'（预留，
   // 桌面端未来补上 app.setAppUserModelId 后启用）。非法值回落 powershell。
   const delivery = config.delivery === 'renderer' ? 'renderer' : 'powershell'
+  // config.shell：通知进程。'powershell'（默认，每台 Windows 必有）/
+  // 'pwsh'（pwsh 7，找不到/起不来回落 5.1 并记日志）/'auto'（pwsh 优先，
+  // 回落静默）。解析在加载期一次完成，toast() 只消费结果。
+  const shellPick = pickShell(config.shell)
+  toastShell = shellPick.shell
   const muted = loadPrefs(prefsPath)
   const persist = () => {
     try {
@@ -278,7 +347,15 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  diag('插件已加载（v1.1.0，投递 ' + delivery + '，静音 ' + muted.size + ' 个会话），注册事件监听器')
+  diag(
+    '插件已加载（v1.2.0，投递 ' +
+      delivery +
+      '，shell ' +
+      shellText(shellPick) +
+      '，静音 ' +
+      muted.size +
+      ' 个会话），注册事件监听器',
+  )
   const sessionTitle = ctx.sessionTitle
 
   // ── 事件队列（长轮询投递）────────────────────────────────────────────

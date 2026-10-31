@@ -25,8 +25,11 @@
 //      openSession 接线、长轮询免 setTimeout 续轮、样式原子化。
 //  11. toast-notify.ps1 静态断言：存在、UTF-8 BOM（EF BB BF——无 BOM 被
 //      PS 5.1 按 GBK 误读、param 崩、静默失败）、按进程名聚焦、无隐藏执行。
+//  12. pickShell 单测（注入假 probe/liveness）：pwsh 找到 → 绝对路径；
+//      未找到 / 存活探针失败（Store 别名失效）→ 回落 powershell.exe（via
+//      判据）；config 缺席与非法值 → 默认；shellText 诊断文案。
 // 运行：node D:\TS\dsh-desktop-notify\selftest.mjs
-import { apply as pluginApply, loadPrefs, savePrefs, testHooks } from './index.js'
+import { apply as pluginApply, loadPrefs, pickShell, savePrefs, shellText, testHooks } from './index.js'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -153,12 +156,41 @@ try {
   ok(/window\.focus\(\)/.test(clientSrc), '点击路径附带 window.focus() 兜底')
   ok(/new Notification\(/.test(clientSrc), 'renderer 模式保留 new Notification() 路径')
   ok(/tag: 'dshdn:'/.test(clientSrc), '渲染器通知 tag 按会话复用')
-  ok(clientSrc.includes('v1.1.0 事件长轮询已启动'), '控制台横幅版本 v1.1.0（版本判据）')
+  ok(clientSrc.includes('v1.2.0 事件长轮询已启动'), '控制台横幅版本 v1.2.0（版本判据）')
   ok(/continue \/\/ 立即续轮/.test(clientSrc), '成功响应在 fetch 链内立即续轮（后台窗口不被节流）')
   ok(!/installStyles\s*\(/.test(clientSrc), '无 installStyles（不经 head 注入）')
   ok(/h\(['"]style['"]/.test(clientSrc), '组件随行渲染 <style>（伪类规则与按钮同一 commit）')
   ok(/style:\s*\{/.test(clientSrc), '按钮带内联 style 对象（静态外观不依赖样式表）')
   ok(/!important/.test(clientSrc), 'hover 背景带 !important（压过内联 background）')
+
+  // ══ pickShell 单测（config.shell 解析：pwsh 探测与 5.1 回落）══════════
+  console.log('—— pickShell：shell 解析与回落 ——')
+  ok(pickShell(undefined).shell === 'powershell.exe' && pickShell(undefined).via === 'default',
+    'config 缺席 → 默认 powershell.exe（via=default，市场分发零依赖）')
+  ok(pickShell('powershell').via === 'default' && pickShell('bogus').via === 'default',
+    "'powershell' 与非法值 → 默认 powershell.exe")
+  const pwshPath = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
+  const hit = pickShell('pwsh', () => pwshPath, () => true)
+  ok(hit.shell === pwshPath && hit.via === 'pwsh', 'shell=pwsh 且探测成功 → pwsh 绝对路径（via=pwsh）')
+  ok(pickShell('auto', () => 'C:\\pwsh.exe', () => true).via === 'pwsh', 'shell=auto 同样取 pwsh')
+  const miss = pickShell('pwsh', () => null)
+  ok(miss.via === 'pwsh-not-found' && miss.shell === 'powershell.exe',
+    'pwsh 未找到 → 回落 powershell.exe（via=pwsh-not-found）')
+  let livenessCalls = 0
+  ok(pickShell('auto', () => null, () => { livenessCalls++; return true }).via === 'pwsh-not-found'
+      && livenessCalls === 0,
+    '未找到时不再做存活探针（省一次 spawn）')
+  ok(pickShell('pwsh', () => 'C:\\pwsh.exe', () => false).via === 'pwsh-probe-failed',
+    'pwsh 存活探针失败（Store 别名失效）→ 回落（via=pwsh-probe-failed）')
+  ok(pickShell('pwsh', () => '').via === 'pwsh-not-found', 'probe 返回空串 → 视为未找到')
+  ok(shellText({ shell: 'C:\\p\\pwsh.exe', via: 'pwsh' }) === 'pwsh @ C:\\p\\pwsh.exe',
+    'shellText：pwsh 绝对路径入诊断行')
+  ok(shellText({ shell: 'powershell.exe', via: 'pwsh-not-found' }).includes('回落')
+      && shellText({ shell: 'powershell.exe', via: 'pwsh-probe-failed' }).includes('回落')
+      && shellText({ shell: 'powershell.exe', via: 'default' }) === 'powershell.exe',
+    'shellText：回落文案与默认文案')
+  ok(hostSrc.includes('spawn(toastShell'), 'toast() 的 spawn 目标来自 pickShell 解析结果')
+  ok(hostSrc.includes('v1.2.0'), '宿主加载诊断行版本 v1.2.0（版本判据）')
 } catch (err) {
   console.error('FAIL: apply() 抛出异常:', err.stack)
   process.exit(1)
@@ -595,5 +627,5 @@ run()
       console.error(`\n${failures} 处失败`)
       process.exit(1)
     }
-    console.log('\n全部自测通过 ✅（waterfall + 标题 + 全负载 + 偏好/路由/守卫(无-Origin 放行) + PS 投递/防抖/静音 + 点击长轮询/断连/容量 + notify-click 双通道去重 + 退出码端到端 + renderer 模式 + PS BOM/进程聚焦 + client 分发/守卫/样式）')
+    console.log('\n全部自测通过 ✅（waterfall + 标题 + 全负载 + 偏好/路由/守卫(无-Origin 放行) + PS 投递/防抖/静音 + 点击长轮询/断连/容量 + notify-click 双通道去重 + 退出码端到端 + renderer 模式 + PS BOM/进程聚焦 + shell 选择/回落 + client 分发/守卫/样式）')
   })
