@@ -29,7 +29,7 @@
 //      未找到 / 存活探针失败（Store 别名失效）→ 回落 powershell.exe（via
 //      判据）；config 缺席与非法值 → 默认；shellText 诊断文案。
 // 运行：node D:\TS\dsh-desktop-notify\selftest.mjs
-import { apply as pluginApply, loadPrefs, pickShell, savePrefs, shellText, testHooks } from './index.js'
+import { apply as pluginApply, findPwsh, loadPrefs, pickShell, savePrefs, shellText, testHooks } from './index.js'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -156,7 +156,7 @@ try {
   ok(/window\.focus\(\)/.test(clientSrc), '点击路径附带 window.focus() 兜底')
   ok(/new Notification\(/.test(clientSrc), 'renderer 模式保留 new Notification() 路径')
   ok(/tag: 'dshdn:'/.test(clientSrc), '渲染器通知 tag 按会话复用')
-  ok(clientSrc.includes('v1.2.0 事件长轮询已启动'), '控制台横幅版本 v1.2.0（版本判据）')
+  ok(clientSrc.includes('v1.3.0 事件长轮询已启动'), '控制台横幅版本 v1.3.0（版本判据）')
   ok(/continue \/\/ 立即续轮/.test(clientSrc), '成功响应在 fetch 链内立即续轮（后台窗口不被节流）')
   ok(!/installStyles\s*\(/.test(clientSrc), '无 installStyles（不经 head 注入）')
   ok(/h\(['"]style['"]/.test(clientSrc), '组件随行渲染 <style>（伪类规则与按钮同一 commit）')
@@ -189,8 +189,20 @@ try {
       && shellText({ shell: 'powershell.exe', via: 'pwsh-probe-failed' }).includes('回落')
       && shellText({ shell: 'powershell.exe', via: 'default' }) === 'powershell.exe',
     'shellText：回落文案与默认文案')
+  // findPwsh 顺序：显式路径优先于 where.exe（宿主 PATH 缺用户级目录的根因修复）。
+  const storePath = (process.env.LOCALAPPDATA ?? 'C:\\U\\30779\\AppData\\Local')
+    + '\\Microsoft\\WindowsApps\\pwsh.exe'
+  const msiPath = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
+  ok(findPwsh(() => false, () => null) === null, 'findPwsh：全部候选缺失 → null')
+  ok(findPwsh((p) => p === storePath, () => msiPath) === storePath,
+    'findPwsh：Store 别名存在 → 优先返回（不看 where）')
+  ok(findPwsh((p) => p === msiPath, () => null) === msiPath, 'findPwsh：仅 MSI 存在 → MSI 路径')
+  ok(findPwsh((p) => p === 'C:\\bin\\pwsh.exe', () => 'C:\\bin\\pwsh.exe') === 'C:\\bin\\pwsh.exe',
+    'findPwsh：显式路径全缺 → where.exe 兜底命中')
+  ok(findPwsh((p) => p === msiPath, () => null) !== 'C:\\Program Files\\PowerShell\\7-preview\\pwsh.exe',
+    'findPwsh：正式版 MSI 优先于 preview')
   ok(hostSrc.includes('spawn(toastShell'), 'toast() 的 spawn 目标来自 pickShell 解析结果')
-  ok(hostSrc.includes('v1.2.0'), '宿主加载诊断行版本 v1.2.0（版本判据）')
+  ok(hostSrc.includes('v1.3.0'), '宿主加载诊断行版本 v1.3.0（版本判据）')
 } catch (err) {
   console.error('FAIL: apply() 抛出异常:', err.stack)
   process.exit(1)

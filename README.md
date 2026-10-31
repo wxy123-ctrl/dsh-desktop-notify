@@ -53,7 +53,7 @@ web profile 验证多年的同通道），点击跳转保持桌面原生：
 | waterfall 任何路径 `return next()` | 不调用会否决链条，dsh-tools 崩（2026-08 事故） |
 | 路由守卫「Origin 缺席放行」 | 桌面壳转发删除 Origin 头；sysnotify 严格守卫会 403 桌面请求 |
 
-## 通知用哪个 PowerShell：5.1 vs 7（v1.2.0）
+## 通知用哪个 PowerShell：5.1 vs 7（v1.3.0）
 
 气泡脚本只用两版公共语法（WinForms NotifyIcon、P/Invoke、HttpWebRequest），
 `powershell.exe`（5.1）与 `pwsh.exe`（7）**功能完全等价**（已在 7.6 实测：
@@ -75,10 +75,17 @@ web profile 验证多年的同通道），点击跳转保持桌面原生：
     shell: pwsh       # 默认 powershell；'auto' = pwsh 优先、回落静默
 ```
 
-解析在**加载期一次完成**：`where.exe pwsh` 定位 → 启动存活探针
-（`-NoProfile -Command exit 0`，5s 超时）——找不到或起不来（如 Store 版别名
-失效、pwsh 被卸载）**一律回落 powershell.exe**，通知不灭。`desktop-notify.log`
-加载行即判据：
+解析在**加载期一次完成**，候选按优先级（v1.3.0 起，修宿主 PATH 缺用户级
+目录导致 Store 版 pwsh 探不到的问题）：
+
+1. `%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`（Store 版别名——不依赖 PATH）
+2. `C:\Program Files\PowerShell\7\pwsh.exe` / `7-preview\pwsh.exe`（MSI 标准路径）
+3. `where.exe pwsh`（PATH 兜底；⚠️ Electron 宿主的 PATH 不含用户级目录，
+   2026-10-31 实测宿主里 where 探不到 Store 版而工具进程能探到）
+
+首个存在者再过**启动存活探针**（`-NoProfile -Command exit 0`，5s 超时）——
+起不来（如 Store 版别名失效、pwsh 被卸载）**一律回落 powershell.exe**，
+通知不灭。`desktop-notify.log` 加载行即判据：
 
 - `shell pwsh @ C:\…\pwsh.exe`（用上了 pwsh）
 - `shell powershell.exe（pwsh 未找到，已回落）` / `（pwsh 探针失败，已回落）`

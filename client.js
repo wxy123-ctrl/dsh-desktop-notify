@@ -1,4 +1,4 @@
-// dsh-desktop-notify — browser half（v1.2.0，DSH 桌面端专用）。
+// dsh-desktop-notify — browser half（v1.3.0，DSH 桌面端专用）。
 //
 // 桌面守卫：本插件只在 DSH 桌面端（Electron 渲染器，页面协议 dsh-app://app）
 // 生效——apply() 开头判定，非桌面环境（如误装入 web profile 的浏览器页签）
@@ -328,7 +328,7 @@ window.__ModuleLoader__.load({
           }
         }
         // 观测点：一眼确认桌面侧轮询代码在跑（版本号即代码代次）。
-        try { console.info('[dsh-desktop-notify] v1.2.0 事件长轮询已启动（桌面模式，点击跳转 + renderer 通知兜底）') } catch { /* noop */ }
+        try { console.info('[dsh-desktop-notify] v1.3.0 事件长轮询已启动（桌面模式，点击跳转 + renderer 通知兜底）') } catch { /* noop */ }
         void run()
         return () => {
           stopped = true

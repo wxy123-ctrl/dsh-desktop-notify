@@ -130,8 +130,10 @@ let clickUrl = ''
 /** 通知进程：apply() 时经 pickShell() 解析（默认 'powershell.exe'）。 */
 let toastShell = 'powershell.exe'
 
-/** where.exe 定位 pwsh（取首个非空行，须真实存在；WindowsApps 执行别名
- *  是 0 字节重解析点，existsSync 为真，能否启动交给存活探针判定）。 */
+/** where.exe 定位 pwsh（取首个非空行；WindowsApps 执行别名是 0 字节重解析
+ *  点，existsSync 为真，能否启动交给存活探针判定）。仅作 PATH 兜底——
+ *  Electron 宿主的 PATH 不含用户级目录，where 在宿主里探不到 Store 版
+ *  pwsh（2026-10-31 实测：宿主「pwsh 未找到」而工具进程能找到）。 */
 function wherePwsh() {
   try {
     const r = spawnSync('where.exe', ['pwsh'], { timeout: 5000, windowsHide: true })
@@ -161,11 +163,32 @@ function pwshAlive(path) {
   }
 }
 
+/** 按优先级找 pwsh：① %LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe
+ *  （Store 版别名——不依赖宿主 PATH）②③ MSI 标准路径（x64 / preview）
+ *  ④ where.exe（PATH 兜底）。exists / where 可注入（selftest）。 */
+export function findPwsh(exists = existsSync, where = wherePwsh) {
+  const list = []
+  const local = typeof process.env.LOCALAPPDATA === 'string' ? process.env.LOCALAPPDATA : ''
+  if (local !== '') list.push(local + '\\Microsoft\\WindowsApps\\pwsh.exe')
+  list.push('C:\\Program Files\\PowerShell\\7\\pwsh.exe')
+  list.push('C:\\Program Files\\PowerShell\\7-preview\\pwsh.exe')
+  const hit = where()
+  if (typeof hit === 'string' && hit !== '') list.push(hit)
+  for (const p of list) {
+    try {
+      if (exists(p)) return p
+    } catch {
+      /* 单个候选探测失败继续下一个 */
+    }
+  }
+  return null
+}
+
 /** 解析通知进程：'powershell'（默认/非法值）→ powershell.exe；'pwsh' /
  *  'auto' → 探测 pwsh，找不到（pwsh-not-found）或起不来（pwsh-probe-
  *  failed）一律回落 powershell.exe。probe / liveness 可注入（selftest）。
  *  返回 { shell, via }，via 供诊断日志区分「用了 pwsh」与「回落」。 */
-export function pickShell(shellConfig, probe = wherePwsh, liveness = pwshAlive) {
+export function pickShell(shellConfig, probe = () => findPwsh(), liveness = pwshAlive) {
   if (shellConfig !== 'pwsh' && shellConfig !== 'auto') {
     return { shell: 'powershell.exe', via: 'default' }
   }
@@ -348,7 +371,7 @@ export function apply(ctx, config = {}) {
   }
 
   diag(
-    '插件已加载（v1.2.0，投递 ' +
+    '插件已加载（v1.3.0，投递 ' +
       delivery +
       '，shell ' +
       shellText(shellPick) +
