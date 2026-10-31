@@ -56,7 +56,7 @@ web profile 验证多年的同通道），点击跳转保持桌面原生：
 | waterfall 任何路径 `return next()` | 不调用会否决链条，dsh-tools 崩（2026-08 事故） |
 | 路由守卫「Origin 缺席放行」 | 桌面壳转发删除 Origin 头；sysnotify 严格守卫会 403 桌面请求 |
 
-## 通知用哪个 PowerShell：5.1 vs 7（v1.3.0）
+## 通知用哪个 PowerShell：5.1 vs 7（v1.3.1）
 
 气泡脚本只用两版公共语法（WinForms NotifyIcon、P/Invoke、HttpWebRequest），
 `powershell.exe`（5.1）与 `pwsh.exe`（7）**功能完全等价**（已在 7.6 实测：
@@ -78,17 +78,22 @@ web profile 验证多年的同通道），点击跳转保持桌面原生：
     shell: pwsh       # 默认 powershell；'auto' = pwsh 优先、回落静默
 ```
 
-解析在**加载期一次完成**，候选按优先级（v1.3.0 起，修宿主 PATH 缺用户级
-目录导致 Store 版 pwsh 探不到的问题）：
+解析在**加载期一次完成**，候选按优先级（v1.3.1 修正）：
 
-1. `%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`（Store 版别名——不依赖 PATH）
+1. `%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`（Store 版别名——不依赖
+   PATH；LOCALAPPDATA 缺失时用 `os.homedir()` 拼兜底）
 2. `C:\Program Files\PowerShell\7\pwsh.exe` / `7-preview\pwsh.exe`（MSI 标准路径）
-3. `where.exe pwsh`（PATH 兜底；⚠️ Electron 宿主的 PATH 不含用户级目录，
-   2026-10-31 实测宿主里 where 探不到 Store 版而工具进程能探到）
+3. `where.exe pwsh`（PATH 兜底）
 
-首个存在者再过**启动存活探针**（`-NoProfile -Command exit 0`，5s 超时）——
-起不来（如 Store 版别名失效、pwsh 被卸载）**一律回落 powershell.exe**，
-通知不灭。`desktop-notify.log` 加载行即判据：
+⚠️ **存在性判定用 lstat 语义**（v1.3.1 真凶修复）：Node 的 `existsSync`/
+`statSync` 对 WindowsApps 执行别名（APPEXECLINK 重解析点）返回 **EACCES**，
+v1.2.0–v1.3.0 的「pwsh 未找到，已回落」正是它——Store 版装了也探测不到，
+曾误诊为宿主 PATH 问题（PATH 确实也缺用户级目录，但不是主因）。
+
+首个**lstat 可见**的候选再过**启动存活探针**（`-NoProfile -Command exit 0`，
+5s 超时）——起不来（如别名失效、pwsh 被卸载）**一律回落 powershell.exe**，
+通知不灭；失败时日志附 `pwsh 探测详情 {alias,msi,msiPreview,where}` 判定
+摘要。`desktop-notify.log` 加载行即判据：
 
 - `shell pwsh @ C:\…\pwsh.exe`（用上了 pwsh）
 - `shell powershell.exe（pwsh 未找到，已回落）` / `（pwsh 探针失败，已回落）`
@@ -168,7 +173,7 @@ React commit 生灭）。
 | `desktop-notify.log` | 诊断日志（加载 / spawn / 入队 / 投递唤醒 / 点击双通道 / 路由异常，无条件落盘） |
 | `package.json` | `dsh.bundle.patch` 声明 bundle 补丁，`dsh.client` 声明浏览器半边 |
 | `cordis.patch.yml` | bundle 补丁：`insert` 行 `{id: desktop-notify, name: dsh-desktop-notify}` |
-| `selftest.mjs` | 自测：`node selftest.mjs`（165 项断言，无 UI 依赖，含真子进程退出码端到端） |
+| `selftest.mjs` | 自测：`node selftest.mjs`（170 项断言，无 UI 依赖，含真子进程退出码端到端） |
 | `locale/zh.json` `locale/en.json` | 插件页（设置 → 内置插件）卡片的中英文标题与描述（`meta.title` / `meta.description`） |
 | `icon.svg` | 插件页卡片图标（package.json 顶层 `icon` 字段声明） |
 
@@ -200,7 +205,7 @@ React commit 生灭）。
     delivery: renderer   # 默认 powershell
 ```
 
-## 常驻气泡进程（warm host，v1.3.0 默认开启）
+## 常驻气泡进程（warm host，v1.3.0+ 默认开启）
 
 每条通知冷启 PowerShell（自载 .NET + Add-Type 运行时编译）要 **400–1500ms**，
 是气泡延迟的大头。v1.3.0 起默认改用常驻进程摊销：
@@ -215,8 +220,14 @@ notify() → toast-spool.jsonl 追加一行 {id,title,body,sid,token}
 - **生命周期**：加载时（webServer 就绪）或首条通知拉起；每 ~6s 自查宿主
   PID，宿主退出即退场；插件停用/重挂时杀掉重建。崩溃/被杀 → 下条通知自动
   回落**逐次 spawn**（toast-notify.ps1 旧路径），30s 内不重启（防死循环）。
+  **投递前 pid 实查**（v1.3.1）：进程可能无声消失（exit 事件不触发，疑似
+  Job 对象/安全软件击杀）——每次投递前用信号 0 探测，死了当场回落，
+  `warmAlive` 标志不再被信任为唯一依据。
 - **基线不回放**：启动/文件变短时只记现有最大 id 不弹历史；宿主重启后
   spoolSeq 归零 ⇒ apply 时截断 spool 配套（残留 warm host 也会因变短重建基线）。
+  ⚠️ v1.3.1 修复：**空 spool 启动时基线必须立即成立**——v1.3.0 空文件分支
+  不置位，宿主重启后的**第一条通知被当历史静默吞掉**（2026-11-01「通知完全
+  不见」事故的直接根因，日志表现为 `spool→warm host` 有行而无气泡）。
 - **退出**：`config: { warmHost: false }` 一键退回逐次 spawn；spool 写不进
   （只读目录等）也会自动整体退回。
 - ⚠️ **安全软件注意**：命令行纪律不变（明文 `-File` + 具名参数，无隐藏
@@ -227,23 +238,26 @@ notify() → toast-spool.jsonl 追加一行 {id,title,body,sid,token}
 
 ## 排障（按投递链三环）
 
-1. **宿主环**：`desktop-notify.log` 应有「插件已加载（v1.3.0，投递
-   powershell，shell …，静音 N 个会话）」+「warm host 已启动（webServer）」；
-   触发事件后有 `notify kind=… 投递 toast` 行。没有 → 事件未到或宿主半边
+1. **宿主环**：`desktop-notify.log` 应有「插件已加载（v1.3.1，投递
+   powershell，shell …，静音 N 个会话）」+「warm host 已启动（webServer）
+   …pid=N」；触发事件后有 `notify kind=… 投递 toast` 行。没有 → 事件未到或宿主半边
    未加载（确认 bundle 注册 + 已重启桌面端）。shell 段显示「已回落」→
    config.shell 指向的 pwsh 不可用（未装/别名失效），已自动用 5.1 兜底，
    通知不受影响。
 2. **气泡环**：warm 模式看「toast spool→warm host id=…」行 + `warm host
-   退出 code=…`（退出后回落逐次 spawn）。逐次 spawn 模式出现
-   `toast 进程退出码 N`（N≠3）→ PS 脚本执行失败（检查 BOM / 安全软件拦截
-   记录）；`toast spawn 失败` → 所选 shell 可执行文件起不来（pwsh 运行中
-   被卸载等，重启宿主自动回落）。
+   退出 code=…`（退出后回落逐次 spawn）。有 `spool→warm host` 行而无气泡 →
+   warm host 存活但气泡被环境吞（确认进程表里 shell 进程在跑；重启宿主后
+   第一条通知必弹是 v1.3.1 的验收红线）；`warm host 疑似死亡（pid 实查
+   失败）` → 进程无声消失已自动回落，重复出现查安全软件/Job 对象。逐次
+   spawn 模式出现 `toast 进程退出码 N`（N≠3）→ PS 脚本执行失败（检查
+   BOM / 安全软件拦截记录）；`toast spawn 失败` → 所选 shell 可执行文件
+   起不来（pwsh 运行中被卸载等，重启宿主自动回落）。
 3. **点击环**：点击气泡后 log 应有 `notify-click HTTP 信号 sid=…`（warm
    模式只有 HTTP 通道；逐次 spawn 模式另有 `toast 点击（退出码通道）` 兜底）
    + `notify-events 点击投递 …唤醒 1 个等待请求`；桌面端 DevTools 控制台
    `[dsh-desktop-notify] 事件到达 click <sid>`。窗口没切 → 对比控制台有无
    `openSession 失败` 警告；页面轮询死 → 确认横幅
-   `[dsh-desktop-notify] v1.3.0 事件长轮询已启动` 存在，刷新窗口一次。
+   `[dsh-desktop-notify] v1.3.1 事件长轮询已启动` 存在，刷新窗口一次。
 
 ## 已知边界
 

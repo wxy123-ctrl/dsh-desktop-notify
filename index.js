@@ -136,10 +136,10 @@ let clickUrl = ''
 /** 通知进程：apply() 时经 pickShell() 解析（默认 'powershell.exe'）。 */
 let toastShell = 'powershell.exe'
 
-/** where.exe 定位 pwsh（取首个非空行；WindowsApps 执行别名是 0 字节重解析
- *  点，existsSync 为真，能否启动交给存活探针判定）。仅作 PATH 兜底——
- *  Electron 宿主的 PATH 不含用户级目录，where 在宿主里探不到 Store 版
- *  pwsh（2026-10-31 实测：宿主「pwsh 未找到」而工具进程能找到）。 */
+/** where.exe 定位 pwsh（取首个非空行；有效性交给 findPwsh 的 pathPresent
+ *  与存活探针——不在此做 stat：WindowsApps 执行别名会被 stat/existsSync 以
+ *  EACCES 拒掉，v1.2.0–v1.3.0「pwsh 未找到」误诊为 PATH 问题的真凶正是它，
+ *  2026-11-01 实测：lstatSync 通过、statSync EACCES、spawnSync status=0）。 */
 function wherePwsh() {
   try {
     const r = spawnSync('where.exe', ['pwsh'], { timeout: 5000, windowsHide: true })
@@ -148,9 +148,41 @@ function wherePwsh() {
       .split(/\r?\n/)
       .map((s) => s.trim())
       .find((s) => s !== '')
-    return line && existsSync(line) ? line : null
+    return line && line !== '' ? line : null
   } catch {
     return null
+  }
+}
+
+/** 路径存在性（lstat 语义）：执行别名（APPEXECLINK 重解析点）stat 会
+ *  EACCES，lstat 看条目本身 ⇒ 判定存在；真缺失抛 ENOENT ⇒ 不存在。
+ *  最终能否用仍由 pwshAlive 的真 spawn 探针裁决。 */
+function pathPresent(p) {
+  try {
+    lstatSync(p)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** %LOCALAPPDATA%（宿主 env 可能被剥——PATH 已证实缺用户级条目）；
+ *  缺失时用 os.homedir() 拼标准位置（homedir 走 Win32 API 兜底，不依赖 env）。 */
+function localAppDir() {
+  const env = process.env.LOCALAPPDATA
+  if (typeof env === 'string' && env !== '') return env
+  return homedir() + '\\AppData\\Local'
+}
+
+/** pwsh 候选探测报告（仅诊断用：未找到/探针失败时记一行，不再猜原因）。 */
+export function pwshProbeReport(exists = pathPresent, where = wherePwsh) {
+  const alias = localAppDir() + '\\Microsoft\\WindowsApps\\pwsh.exe'
+  return {
+    localapp: localAppDir(),
+    alias: exists(alias),
+    msi: exists('C:\\Program Files\\PowerShell\\7\\pwsh.exe'),
+    msiPreview: exists('C:\\Program Files\\PowerShell\\7-preview\\pwsh.exe'),
+    where: where(),
   }
 }
 
@@ -169,13 +201,12 @@ function pwshAlive(path) {
   }
 }
 
-/** 按优先级找 pwsh：① %LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe
- *  （Store 版别名——不依赖宿主 PATH）②③ MSI 标准路径（x64 / preview）
- *  ④ where.exe（PATH 兜底）。exists / where 可注入（selftest）。 */
-export function findPwsh(exists = existsSync, where = wherePwsh) {
-  const list = []
-  const local = typeof process.env.LOCALAPPDATA === 'string' ? process.env.LOCALAPPDATA : ''
-  if (local !== '') list.push(local + '\\Microsoft\\WindowsApps\\pwsh.exe')
+/** 按优先级找 pwsh：① %LOCALAPPDATA%（缺失时 homedir 拼兜底）下的
+ *  WindowsApps\pwsh.exe（Store 版别名——不依赖宿主 PATH）②③ MSI 标准
+ *  路径（x64 / preview）④ where.exe（PATH 兜底）。exists / where 可注入
+ *  （selftest）；默认 exists 是 lstat 语义（见 pathPresent）。 */
+export function findPwsh(exists = pathPresent, where = wherePwsh) {
+  const list = [localAppDir() + '\\Microsoft\\WindowsApps\\pwsh.exe']
   list.push('C:\\Program Files\\PowerShell\\7\\pwsh.exe')
   list.push('C:\\Program Files\\PowerShell\\7-preview\\pwsh.exe')
   const hit = where()
@@ -262,7 +293,7 @@ function startWarmHost(reason) {
       diag('warm host 退出 code=' + code + '（后续通知回落逐次 spawn，30s 内不重启）')
     })
     child.unref()
-    diag('warm host 已启动（' + reason + '）shell=' + toastShell)
+    diag('warm host 已启动（' + reason + '）shell=' + toastShell + ' pid=' + child.pid)
   } catch (err) {
     warmAlive = false
     diag('warm host 异常: ' + (err?.message ?? String(err)))
@@ -288,18 +319,39 @@ export function spoolAppend(record) {
 
 let spoolSeq = 0 // spool 记录序号（宿主重启归零 ⇒ apply() 截断 spool 配合基线重建）
 
-/** 投递单点：warm 存活 → 追加 spool；否则回落旧逐次 spawn（并尝试拉起
- *  warm）。testHooks.scriptPath 覆盖期间（selftest 真 spawn 用例）不经
+/** warm 子进程实查存活：2026-11-01 实测进程可无声消失（exit/error 事件均
+ *  未触发——疑似 Job 对象/安全软件击杀），warmAlive 标志假真会让通知进
+ *  spool 成黑洞。信号 0 只探测进程存在性，零成本。 */
+function warmChildAlive() {
+  const child = warmChild
+  if (child === null || child === undefined) return false
+  if (child.exitCode !== null || child.signalCode !== null) return false
+  try {
+    process.kill(child.pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 投递单点：warm 存活（实查）→ 追加 spool；否则回落旧逐次 spawn（并尝试
+ *  拉起 warm）。testHooks.scriptPath 覆盖期间（selftest 真 spawn 用例）不经
  *  warm——那些用例正是要验证逐次 spawn 的退出码通道。 */
 function deliverToast(title, body, sid) {
-  if (warmEnabled && warmAlive && warmSpoolPath !== '' && testHooks.scriptPath === undefined) {
-    const id = ++spoolSeq
-    const token = sid !== '' ? randomUUID() : ''
-    if (spoolAppend({ id, title, body, sid, token, ts: Date.now() })) {
-      diag('toast spool→warm host id=' + id + ' sid=' + sid + ' title=' + clip(title, 80))
-      return
+  if (warmEnabled && warmSpoolPath !== '' && testHooks.scriptPath === undefined) {
+    if (warmAlive && !warmChildAlive()) {
+      warmAlive = false
+      diag('warm host 疑似死亡（pid 实查失败），本条回落逐次 spawn')
     }
-    diag('spool 写盘失败，回落逐次 spawn')
+    if (warmAlive) {
+      const id = ++spoolSeq
+      const token = sid !== '' ? randomUUID() : ''
+      if (spoolAppend({ id, title, body, sid, token, ts: Date.now() })) {
+        diag('toast spool→warm host id=' + id + ' sid=' + sid + ' title=' + clip(title, 80))
+        return
+      }
+      diag('spool 写盘失败，回落逐次 spawn')
+    }
   }
   if (warmEnabled && testHooks.scriptPath === undefined) startWarmHost('投递时未存活')
   toast(title, body, sid)
@@ -405,6 +457,12 @@ export const testHooks = {
   warmState: () => ({ enabled: warmEnabled, alive: warmAlive, spool: warmSpoolPath }),
   setWarmAlive: (v) => {
     warmAlive = v
+    // 播种/清除假 child：warmChildAlive() 的 pid 实查要有对象可查
+    // （pid=自身 ⇒ 信号 0 探测恒通过）。仅 selftest 使用；生产路径
+    // warmChild 由 startWarmHost 的真实 spawn 赋值。
+    warmChild = v
+      ? { pid: process.pid, exitCode: null, signalCode: null, kill() {} }
+      : null
   },
   /** selftest 置 true：阻断真实 warm host 拉起（含 webServer 注入回调路径）。 */
   suppressWarmSpawn: false,
@@ -491,6 +549,15 @@ export function apply(ctx, config = {}) {
   // 回落静默）。解析在加载期一次完成，toast() 只消费结果。
   const shellPick = pickShell(config.shell)
   toastShell = shellPick.shell
+  if (shellPick.via !== 'pwsh' && shellPick.via !== 'default') {
+    // 探测失败附候选判定摘要（2026-11-01 教训：existsSync 误杀 Store 别名
+    // 被误诊为 PATH 问题——以后看日志不用猜）。
+    try {
+      diag('pwsh 探测详情 ' + JSON.stringify(pwshProbeReport()))
+    } catch {
+      /* 报告失败不影响主流程 */
+    }
+  }
   // config.warmHost（默认 true，仅 powershell 投递）：常驻气泡进程，免掉
   // 每条通知冷启 PowerShell。config.spoolPath：测试用覆盖；默认本目录
   // toast-spool.jsonl。每次 apply 截断 spool：宿主重启后 spoolSeq 归零，
@@ -549,7 +616,7 @@ export function apply(ctx, config = {}) {
   }
 
   diag(
-    '插件已加载（v1.3.0，投递 ' +
+    '插件已加载（v1.3.1，投递 ' +
       delivery +
       '，shell ' +
       shellText(shellPick) +

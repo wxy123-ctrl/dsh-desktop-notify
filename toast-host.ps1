@@ -165,7 +165,12 @@ $timer.Add_Tick({
 			}
 			$script:baseline = $true
 		} elseif ((Test-Path $Spool) -and ((Get-Item $Spool).Length -eq 0)) {
-			if ($script:lastLen -gt 0) { $script:baseline = $false; $script:lastId = [long]0 }
+			# 空文件（宿主 apply 截断后启动/重启）：基线=空（lastId=0）。
+			# ⚠️ 必须置 baseline=true——v1.3.0 此分支不置位，启动后第一条真通知
+			# 仍按「基线扫描」被静默吞掉（2026-11-01 ✅Greeting 事故：宿主重启后
+			# 第一条通知必被吞）。空文件无可回放，基线直接成立。
+			$script:baseline = $true
+			$script:lastId = [long]0
 			$script:lastLen = 0
 		}
 	} catch { }

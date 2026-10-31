@@ -32,13 +32,13 @@
 //      + 死亡回落逐次 spawn + 超 200 行裁剪末 20；toast-host.ps1 静态断言
 //      （BOM/无隐藏执行/PID 自查/150ms 轮询/基线不回放）。
 // 运行：node D:\TS\dsh-desktop-notify\selftest.mjs
-import { apply as pluginApply, findPwsh, isSubagentSession, loadPrefs, pickShell, savePrefs, shellText, spoolAppend, testHooks } from './index.js'
+import { apply as pluginApply, findPwsh, isSubagentSession, loadPrefs, pickShell, pwshProbeReport, savePrefs, shellText, spoolAppend, testHooks } from './index.js'
 // 全程抑制真实 warm host 拉起（apply 的 webServer 注入回调也会触发
 // startWarmHost；selftest 不得启动常驻进程）。warm 通道用 setWarmAlive
 // 强制状态 + tmp spool 验证。
 testHooks.suppressWarmSpawn = true
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -163,7 +163,7 @@ try {
   ok(/window\.focus\(\)/.test(clientSrc), '点击路径附带 window.focus() 兜底')
   ok(/new Notification\(/.test(clientSrc), 'renderer 模式保留 new Notification() 路径')
   ok(/tag: 'dshdn:'/.test(clientSrc), '渲染器通知 tag 按会话复用')
-  ok(clientSrc.includes('v1.3.0 事件长轮询已启动'), '控制台横幅版本 v1.3.0（版本判据）')
+  ok(clientSrc.includes('v1.3.1 事件长轮询已启动'), '控制台横幅版本 v1.3.1（版本判据）')
   ok(/continue \/\/ 立即续轮/.test(clientSrc), '成功响应在 fetch 链内立即续轮（后台窗口不被节流）')
   ok(!/installStyles\s*\(/.test(clientSrc), '无 installStyles（不经 head 注入）')
   ok(/h\(['"]style['"]/.test(clientSrc), '组件随行渲染 <style>（伪类规则与按钮同一 commit）')
@@ -196,9 +196,10 @@ try {
       && shellText({ shell: 'powershell.exe', via: 'pwsh-probe-failed' }).includes('回落')
       && shellText({ shell: 'powershell.exe', via: 'default' }) === 'powershell.exe',
     'shellText：回落文案与默认文案')
-  // findPwsh 顺序：显式路径优先于 where.exe（宿主 PATH 缺用户级目录的根因修复）。
-  const storePath = (process.env.LOCALAPPDATA ?? 'C:\\U\\30779\\AppData\\Local')
-    + '\\Microsoft\\WindowsApps\\pwsh.exe'
+  // findPwsh 顺序：显式路径优先于 where.exe。候选路径与 localAppDir() 同源
+  // （LOCALAPPDATA 缺失时用 homedir 拼兜底——宿主 env 可能被剥）。
+  const localApp = process.env.LOCALAPPDATA || homedir() + '\\AppData\\Local'
+  const storePath = localApp + '\\Microsoft\\WindowsApps\\pwsh.exe'
   const msiPath = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
   ok(findPwsh(() => false, () => null) === null, 'findPwsh：全部候选缺失 → null')
   ok(findPwsh((p) => p === storePath, () => msiPath) === storePath,
@@ -209,7 +210,16 @@ try {
   ok(findPwsh((p) => p === msiPath, () => null) !== 'C:\\Program Files\\PowerShell\\7-preview\\pwsh.exe',
     'findPwsh：正式版 MSI 优先于 preview')
   ok(hostSrc.includes('spawn(toastShell'), 'toast() 的 spawn 目标来自 pickShell 解析结果')
-  ok(hostSrc.includes('v1.3.0'), '宿主加载诊断行版本 v1.3.0（版本判据）')
+  ok(hostSrc.includes('v1.3.1'), '宿主加载诊断行版本 v1.3.1（版本判据）')
+
+  // ══ v1.3.1 修复判据（2026-11-01 ✅Greeting 事故三根因）══════════════
+  console.log('—— v1.3.1 修复判据 ——')
+  ok(hostSrc.includes('lstatSync'), '存在性检查用 lstat 语义（existsSync 对 Store 别名 EACCES 误杀——v1.2.0 起未找到的真凶）')
+  const probeKeys = pwshProbeReport(() => false, () => null)
+  ok(['localapp', 'alias', 'msi', 'msiPreview', 'where'].every((k) => k in probeKeys),
+    'pwshProbeReport 候选判定摘要字段齐全（失败时入日志，不再猜）')
+  ok(hostSrc.includes('疑似死亡'), '投递前 pid 实查（warm host 静默死亡自动回落逐次 spawn）')
+  ok(hostSrc.includes('pid='), 'warm host 启动行带 pid（排障对账用）')
 
   // ══ isSubagentSession 单测（子代理判定的权威信号）════════════════════
   console.log('—— isSubagentSession：子代理判定 ——')
@@ -232,6 +242,7 @@ try {
   ok(hostPsSrc.includes('Get-Process -Id $ParentPid'), 'warm host 自查宿主 PID（宿主退出即退场）')
   ok(hostPsSrc.includes('$timer.Interval = 150'), 'warm host 150ms UI 线程轮询')
   ok(hostPsSrc.includes('baseline'), 'warm host 基线机制存在（不回放历史通知）')
+  ok(hostPsSrc.includes('基线直接成立'), '空文件分支置位 baseline——宿主重启后首条通知被吞的修复判据')
   ok(hostPsSrc.includes('ConvertFrom-Json'), 'warm host 解析 JSONL spool')
   ok(hostSrc.includes('WARM_RESPAWN_MS'), '宿主侧 warm 重启限流（30s）')
   ok(hostSrc.includes("writeFileSync(warmSpoolPath, '', 'utf8')"), 'apply 截断 spool（宿主重启 id 归零的配套）')
