@@ -120,6 +120,24 @@ Windows PowerShell；7 显示 PowerShell）。
 | 等待回答 | `❓ <会话标题>：等待回答` | 问题原文 |
 | 计划待审批 | `📋 <会话标题>：计划待审批` | 计划首标题 + 任务 +「批准执行 / 继续完善」提示 |
 | 出错 | `⚠️ <会话标题>：出错` | 错误信息 |
+| 定时提醒到期（v1.3.0） | `⏰ <会话标题>：定时提醒` | 到期提示内容（schedule 注入会话的瞬间弹出） |
+
+## 子代理会话默认静音（v1.3.0）
+
+AI 拉起的子 Agent（subagent / subagent_fork / workflow 批量子代理）是独立的
+子会话，完成工作时同样会触发 `✅` 通知——2026-10-31 日志实测：一次多角度
+分析连弹 4 条「你是文档分析专家…」类气泡。v1.3.0 起这些会话**默认全部静音**
+（6 类通知都不弹），主会话默认开启：
+
+- **判定依据（权威信号）**：子会话头持久化的 `parentSession`（父会话 id）与
+  `delegationDepth ≥ 1`（dsh-subagent 创建子会话时写入；主会话两者皆无）。
+  任一事件入口首次见到即学习并记诊断行「子代理会话 sid=… 默认静音」。
+- **后果须知**：子代理若触发提权/工具审批，**GUI 审批弹窗照旧**——仅桌面
+  气泡被压，不会漏掉需要你决策的事项。
+- 关闭该默认（恢复子代理通知）：profile patch 配 `muteSubagents: false`。
+- 现存的**已知不通知事件**（有意为之）：审批结果落定（approval/decided）、
+  后台任务结束（job/settled）、team 消息、workflow 子代理起止、每轮 turn
+  边界——噪音考量未纳入，需要时提 issue。
 
 会话标题来自 `sessionTitle` 服务（日志折叠，重启后依然正确）；同一会话同类
 事件 2.5 秒防抖。通知在通知中心归组为 **Windows PowerShell**——桌面端未设置
@@ -129,7 +147,7 @@ AUMID，无法归组到 DSH 应用（见上「为什么」）。
 
 composer 工具行「工作区内修改」芯片右侧的闹钟按钮（`conversation.input.left`
 Slot），点击经 `POST /plugins/dsh-desktop-notify/notify-pref` 切换；静音 = 该会话
-**全部 5 类**通知不投递；偏好持久化到插件目录 `notify-prefs.json`
+**全部 6 类**通知不投递；偏好持久化到插件目录 `notify-prefs.json`
 （`{"muted":[sessionId…]}`，缺席 = 开启，上限 500 条）。按钮样式为 sysnotify
 v1.8.3 的原子化配方（静态外观内联 `<button>`、伪类规则随组件 `<style>` 同一
 React commit 生灭）。
@@ -145,7 +163,7 @@ React commit 生灭）。
 | `desktop-notify.log` | 诊断日志（加载 / spawn / 入队 / 投递唤醒 / 点击双通道 / 路由异常，无条件落盘） |
 | `package.json` | `dsh.bundle.patch` 声明 bundle 补丁，`dsh.client` 声明浏览器半边 |
 | `cordis.patch.yml` | bundle 补丁：`insert` 行 `{id: desktop-notify, name: dsh-desktop-notify}` |
-| `selftest.mjs` | 自测：`node selftest.mjs`（120 项断言，无 UI 依赖，含真子进程退出码端到端） |
+| `selftest.mjs` | 自测：`node selftest.mjs`（143 项断言，无 UI 依赖，含真子进程退出码端到端） |
 | `locale/zh.json` `locale/en.json` | 插件页（设置 → 内置插件）卡片的中英文标题与描述（`meta.title` / `meta.description`） |
 | `icon.svg` | 插件页卡片图标（package.json 顶层 `icon` 字段声明） |
 

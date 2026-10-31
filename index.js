@@ -1,12 +1,16 @@
 // dsh-desktop-notify — 桌面端专用系统通知插件（宿主半边，纯 Node）
 //
 // 与 dsh-sysnotify（web profile，浏览器场景）同构：监听全进程会话事件，
-// 五类时机入队通知——
+// 六类时机入队通知——
 //   ✅ 会话完成工作（running → idle，附最近任务、耗时）
 //   ⏸️ 会话阻塞等待批准（附工具名与原因）
 //   ❓ 会话阻塞等待回答（附问题内容）
 //   📋 plan 模式计划待审批（exit_plan_mode，附计划首标题）
 //   ⚠️ 会话出错（附错误信息）
+//   ⏰ 定时提醒到期（schedule 注入的到期提示词，v1.3.0）
+//
+// 子代理会话（header.parentSession / delegationDepth ≥ 1）默认全部静音
+// （config.muteSubagents: false 可关），主会话默认开启。
 //
 // 差异在投递链路——本插件专用于 DSH 桌面端（Electron，~/.dsh/profiles/desktop）：
 //   宿主事件 → 静音门控 + 防抖 →【delivery: powershell（默认）】spawn
@@ -210,6 +214,32 @@ export function shellText(pick) {
   return 'powershell.exe'
 }
 
+/** 提取 user/message 事件的文本内容（string 或 text parts 拼接；空 = 无文本）。 */
+function messageText(event) {
+  const content = event?.data?.content
+  if (typeof content === 'string') return content.trim()
+  if (Array.isArray(content)) {
+    return content
+      .filter((p) => p && typeof p === 'object' && p.type === 'text' && typeof p.text === 'string')
+      .map((p) => p.text)
+      .join(' ')
+      .trim()
+  }
+  return ''
+}
+
+/** 判定会话是否 AI 拉起的子代理：会话头持久化的 parentSession /
+ *  delegationDepth 是权威信号（dsh-subagent 在创建子会话时写入；主会话
+ *  两者皆无）。runtime 的 options.subagentDepth 不可靠（恢复的子会话不带），
+ *  以持久化头为准。 */
+export function isSubagentSession(session) {
+  const header = session?.header
+  if (header === null || typeof header !== 'object') return false
+  const depth = Number(header.delegationDepth)
+  if (Number.isFinite(depth) && depth > 0) return true
+  return typeof header.parentSession === 'string' && header.parentSession !== ''
+}
+
 /** 弹出一条系统通知：明文 -File + 具名参数；命令行与参数经 CreateProcessW
  *  以 UTF-16 传递，中文无代码页问题。⚠️ spawn 选项只能是 {stdio:'ignore'}——
  *  加 detached/windowsHide 后 NotifyIcon 气泡不显示（DETACHED_PROCESS 迫使
@@ -362,6 +392,20 @@ export function apply(ctx, config = {}) {
   const shellPick = pickShell(config.shell)
   toastShell = shellPick.shell
   const muted = loadPrefs(prefsPath)
+  // config.muteSubagents：AI 拉起的子代理会话（header.parentSession 存在
+  // 或 delegationDepth ≥ 1）全部 6 类通知默认静音；主会话不受影响。
+  // ⚠️ 子代理若触发提权审批，GUI 审批弹窗照旧——仅桌面气泡被压。
+  // 设 false 整体恢复。
+  const muteSubagents = config.muteSubagents !== false
+  /** 已识别的子代理会话 id：任一事件入口首次见到即学习并记一行诊断。 */
+  const subagentSids = new Set()
+  const learnSubagent = (session, where) => {
+    if (!isSubagentSession(session)) return
+    const sid = String(session?.id ?? '')
+    if (sid === '' || subagentSids.has(sid)) return
+    subagentSids.add(sid)
+    diag('子代理会话 sid=' + sid + ' 默认静音（来源 ' + where + '）')
+  }
   const persist = () => {
     try {
       savePrefs(prefsPath, muted)
@@ -482,6 +526,9 @@ export function apply(ctx, config = {}) {
     const sid = String(sessionId ?? '-')
     if (sid === '' || sid === '-') return false
     if (muted.has(sid)) return false
+    // 子代理默认静音门（位于用户静音门之后、防抖之前——被压的会话不记
+    // 防抖键，取消限制后立即可通知）。
+    if (muteSubagents && subagentSids.has(sid)) return false
     const key = kind + '|' + sid
     const now = Date.now()
     const prev = lastAt.get(key)
@@ -771,6 +818,8 @@ export function apply(ctx, config = {}) {
   // 工具结果、子代理注入的 user 角色消息不污染任务文案。
   ctx.on('session/event', (session, event) => {
     try {
+      // 子代理识别学习（任何事件都带会话对象——首次见到即记默认静音）。
+      learnSubagent(session, 'session/event')
       // 「等待批准」的主路径：ApprovalService.request() 先把 approval/asked
       // 写进会话日志，再去派发 answerers。走会话事件 ⇒ 不受 approval/request
       // 瀑布链监听顺序与作用域过滤影响，提权申请（sandbox escalation 走
@@ -798,19 +847,36 @@ export function apply(ctx, config = {}) {
         )
         return
       }
+      // ⏰ 定时提醒到期：dsh-schedule 把到期提示词以 source.kind ===
+      // 'schedule' 的 user/message 注入会话并唤醒代理——此前插件只把它当
+      // 普通消息忽略，窗口在后台时用户得不到任何「提醒到了」的信号。
+      // 真人类输入（kind === 'user'）仍只记 lastTask，不在此列。
+      if (event?.type === 'user/message' && event.data?.source?.kind === 'schedule') {
+        const text = messageText(event)
+        const sid = String(session?.id ?? '')
+        let rTitle
+        try {
+          rTitle = sessionTitle.get(session)?.title ?? undefined
+        } catch {
+          rTitle = undefined
+        }
+        const rst = state.get(sid) ?? { runningSince: 0, lastTask: '' }
+        const rFallback = rst.lastTask
+          ? clip(rst.lastTask, TITLE_MAX)
+          : sid
+            ? '会话 …' + (sid.length > 6 ? sid.slice(-6) : sid)
+            : 'DSH 会话'
+        notify(
+          'reminder',
+          sid,
+          '⏰ ' + (rTitle ? clip(rTitle, TITLE_MAX) : rFallback) + '：定时提醒',
+          text ? '内容：' + clip(text, 120) : '提醒已到期，回到 DSH 查看',
+        )
+        return
+      }
       if (event?.type !== 'user/message') return
       if (event.data?.source?.kind !== 'user') return
-      const content = event.data.content
-      let text = ''
-      if (typeof content === 'string') {
-        text = content
-      } else if (Array.isArray(content)) {
-        text = content
-          .filter((p) => p && typeof p === 'object' && p.type === 'text' && typeof p.text === 'string')
-          .map((p) => p.text)
-          .join(' ')
-      }
-      text = text.trim()
+      const text = messageText(event)
       if (!text) return
       const sid = String(session?.id ?? '')
       const st = state.get(sid) ?? { runningSince: 0, lastTask: '' }
@@ -835,6 +901,7 @@ export function apply(ctx, config = {}) {
   ctx.on('agent/status', (payload) => {
     try {
       const agent = payload?.agent
+      learnSubagent(agent?.session, 'agent/status')
       const sid = String(agent?.id ?? '')
       const st = state.get(sid) ?? { runningSince: 0, lastTask: '' }
       if (payload?.status === 'running') {
@@ -870,6 +937,7 @@ export function apply(ctx, config = {}) {
     (req, next) => {
       try {
         const agent = req?.agent
+        learnSubagent(agent?.session, 'approval/request')
         const sid = String(agent?.id ?? '')
         const { title, task } = info(agent)
         notifyApproval(sid, title, task, String(req?.toolName ?? '未知操作'), req?.reason)
@@ -889,6 +957,7 @@ export function apply(ctx, config = {}) {
     try {
       if (exec?.name === 'ask_user_question') {
         const agent = exec?.agent
+        learnSubagent(agent?.session, 'tools/pre-execute')
         const sid = String(agent?.id ?? '')
         const { title } = info(agent)
         const qs = Array.isArray(exec?.arguments?.questions) ? exec.arguments.questions : []
@@ -918,6 +987,7 @@ export function apply(ctx, config = {}) {
   ctx.on('agent/error', (payload) => {
     try {
       const agent = payload?.agent
+      learnSubagent(agent?.session, 'agent/error')
       const sid = String(agent?.id ?? '')
       const { title } = info(agent)
       const err = payload?.error

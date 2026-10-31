@@ -29,7 +29,7 @@
 //      未找到 / 存活探针失败（Store 别名失效）→ 回落 powershell.exe（via
 //      判据）；config 缺席与非法值 → 默认；shellText 诊断文案。
 // 运行：node D:\TS\dsh-desktop-notify\selftest.mjs
-import { apply as pluginApply, findPwsh, loadPrefs, pickShell, savePrefs, shellText, testHooks } from './index.js'
+import { apply as pluginApply, findPwsh, isSubagentSession, loadPrefs, pickShell, savePrefs, shellText, testHooks } from './index.js'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -203,6 +203,15 @@ try {
     'findPwsh：正式版 MSI 优先于 preview')
   ok(hostSrc.includes('spawn(toastShell'), 'toast() 的 spawn 目标来自 pickShell 解析结果')
   ok(hostSrc.includes('v1.3.0'), '宿主加载诊断行版本 v1.3.0（版本判据）')
+
+  // ══ isSubagentSession 单测（子代理判定的权威信号）════════════════════
+  console.log('—— isSubagentSession：子代理判定 ——')
+  ok(isSubagentSession({ header: { parentSession: 'p', delegationDepth: 1 } }), 'delegationDepth ≥ 1 → 子代理')
+  ok(isSubagentSession({ header: { parentSession: 'session-parent' } }), '仅 parentSession 亦判定（深度字段缺席）')
+  ok(!isSubagentSession({ header: {} }), '空头 → 主会话')
+  ok(!isSubagentSession(undefined) && !isSubagentSession({}), '缺会话/缺头 → 非子代理（保守默认）')
+  ok(isSubagentSession({ header: { delegationDepth: '2' } }), '字符串深度容忍（持久化层宽松读取）')
+  ok(!isSubagentSession({ header: { delegationDepth: 0, parentSession: '' } }), '深度 0 + 空 parent → 主会话')
 } catch (err) {
   console.error('FAIL: apply() 抛出异常:', err.stack)
   process.exit(1)
@@ -305,6 +314,46 @@ ok(true, 'approval/asked 缺字段不抛错')
 // 瀑布链监听器必须 prepend（排在应答者之前）
 const approvalOpt = A.listenerOptions.find((o) => o.name === 'approval/request')
 ok(approvalOpt?.options?.prepend === true, 'approval/request 监听器以 prepend 注册（排在应答者之前）')
+
+// ── 子代理默认静音（v1.3.0）────────────────────────────────────────────
+const childAgent = { id: 'child-uuid-1', session: { id: 'child-uuid-1', header: { parentSession: 'session-abcdef123456', delegationDepth: 1 } } }
+const c0 = toasts
+fire(A.listeners, 'session/event', childAgent.session, {
+  type: 'approval/asked',
+  data: { toolName: 'write', reason: 'escalate sandbox to workspace-write: 子代理提权' },
+})
+ok(toasts === c0, '子代理 approval/asked → 默认静音不弹')
+ok(logText().includes('子代理会话 sid=child-uuid-1 默认静音'), '首次识别子代理记诊断行')
+fire(A.listeners, 'agent/status', { agent: childAgent, status: 'running' })
+fire(A.listeners, 'agent/status', { agent: childAgent, status: 'idle' })
+ok(toasts === c0, '子代理 running→idle 完成通知 → 默认静音不弹')
+
+// ── ⏰ 定时提醒到期（v1.3.0）───────────────────────────────────────────
+const remSid = 'session-reminder-1'
+const r0 = toasts
+fire(A.listeners, 'session/event', { id: remSid }, {
+  type: 'user/message',
+  data: { source: { kind: 'schedule' }, content: 'reminder_prompt_json: "每天 18:00 站会提醒"' },
+})
+ok(toasts === r0 + 1, 'schedule 来源 user/message → 弹 1 条 ⏰ 提醒')
+const remToast = toastLog[toastLog.length - 1]
+ok(String(remToast?.title ?? '').startsWith('⏰'), '提醒标题带 ⏰ 前缀')
+ok(String(remToast?.title ?? '').includes('定时提醒'), '提醒标题含「定时提醒」')
+ok(String(remToast?.body ?? '').includes('站会提醒'), '提醒正文含到期内容')
+ok(remToast?.sid === remSid, '提醒通知 sid 取会话 id')
+fire(A.listeners, 'session/event', { id: remSid }, {
+  type: 'user/message',
+  data: { source: { kind: 'schedule' }, content: '重复到期' },
+})
+ok(toasts === r0 + 1, '同会话提醒 2.5s 防抖只弹一次')
+const r1 = toasts
+fire(A.listeners, 'session/event', { id: 'session-reminder-2' }, {
+  type: 'user/message',
+  data: { source: { kind: 'user' }, content: '人类输入不触发提醒通知' },
+})
+ok(toasts === r1, 'kind=user 的消息不触发 ⏰（仍只记 lastTask）')
+fire(A.listeners, 'session/event', { id: 'session-reminder-3' }, { type: 'user/message', data: { source: { kind: 'schedule' } } })
+ok(toasts === r1 + 1, '空内容提醒 → 弹默认文案不抛错')
 
 // ── waterfall：tools/pre-execute（sysnotify 2026-08 事故的案发现场）────
 fireWaterfall(A.listeners, 'tools/pre-execute', { name: 'ask_user_question', agent, arguments: { questions: [{ question: '选择哪个方案？' }] } })
@@ -625,6 +674,15 @@ const run = async () => {
     '载荷带完整 title/body（client.js 弹渲染器通知的原料）')
   ok(typeof mine[0].seq === 'number', '事件带 seq（长轮询游标）')
 
+  // ══ muteSubagents:false → 子代理通知恢复（第三实例）══════════════════
+  console.log('—— muteSubagents:false：子代理通知恢复 ——')
+  const C = makeFakeCtx()
+  pluginApply(C.ctx, { prefsPath: join(tmpPrefsDir, 'c-prefs.json'), muteSubagents: false })
+  const subOff0 = toasts
+  fire(C.listeners, 'agent/status', { agent: childAgent, status: 'running' })
+  fire(C.listeners, 'agent/status', { agent: childAgent, status: 'idle' })
+  ok(toasts === subOff0 + 1, 'muteSubagents:false → 子代理完成通知恢复（+1）')
+
   // 收尾断言
   if (getTitleCalls === 0) fail('sessionTitle.get() 从未被调用——标题读取路径失效（误用了幻影 API？）')
   if (toasts === 0) fail('拦截计数为 0——通知链路整体失效')
@@ -639,5 +697,5 @@ run()
       console.error(`\n${failures} 处失败`)
       process.exit(1)
     }
-    console.log('\n全部自测通过 ✅（waterfall + 标题 + 全负载 + 偏好/路由/守卫(无-Origin 放行) + PS 投递/防抖/静音 + 点击长轮询/断连/容量 + notify-click 双通道去重 + 退出码端到端 + renderer 模式 + PS BOM/进程聚焦 + shell 选择/回落 + client 分发/守卫/样式）')
+    console.log('\n全部自测通过 ✅（waterfall + 标题 + 全负载 + 偏好/路由/守卫(无-Origin 放行) + PS 投递/防抖/静音 + 点击长轮询/断连/容量 + notify-click 双通道去重 + 退出码端到端 + renderer 模式 + 子代理默认静音/恢复 + ⏰ 提醒 + PS BOM/进程聚焦 + shell 选择/回落 + client 分发/守卫/样式）')
   })
