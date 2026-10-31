@@ -447,6 +447,26 @@ export function apply(ctx, config = {}) {
     return { title: title ? clip(title, TITLE_MAX) : fallback, task }
   }
 
+  /** 「等待批准」通知的统一出口：瀑布链来源与会话事件来源共用。
+   *  ⚠️ 为什么要两条来源：'approval/request' 是 waterfall，真正的应答者
+   *  （dsh-api-remotes → GUI 审批弹窗）在 bundle 顺序上先于本插件注册，
+   *  且它以用户答复终结链条、**不再调用 next()** ⇒ 排在其后的观察型
+   *  监听器永远不会被执行（2026-10-29 起 approval 类通知全灭的根因）。
+   *  'approval/asked' 是 ApprovalService 在询问 answerers **之前**写入
+   *  会话日志的持久化事件，与瀑布链顺序、作用域过滤均无关，作主路径；
+   *  瀑布链监听器保留并 prepend，作为兜底。两条来源同刻触发时由
+   *  2.5s 防抖表（kind|sid）收敛为一条通知。 */
+  const notifyApproval = (sid, title, task, tool, reason) => {
+    if (!sid) return
+    const reasonText = typeof reason === 'string' && reason ? '\n原因：' + clip(reason, 120) : ''
+    notify(
+      'approval',
+      sid,
+      '⏸️ ' + title + '：等待批准',
+      '操作：' + tool + reasonText + (task ? '\n正在执行：' + clip(task, 100) : ''),
+    )
+  }
+
   // ── 浏览器半边通道（可选依赖：webServer 缺席时气泡照弹——spawn 不传
   //    点击参数，纯通知无跳转；仅无页面轮询/静音开关 UI）────────────────
   ctx.inject(['webServer'], (wctx) => {
@@ -651,6 +671,33 @@ export function apply(ctx, config = {}) {
   // 工具结果、子代理注入的 user 角色消息不污染任务文案。
   ctx.on('session/event', (session, event) => {
     try {
+      // 「等待批准」的主路径：ApprovalService.request() 先把 approval/asked
+      // 写进会话日志，再去派发 answerers。走会话事件 ⇒ 不受 approval/request
+      // 瀑布链监听顺序与作用域过滤影响，提权申请（sandbox escalation 走
+      // 同一审批通道）也能第一时间弹窗。
+      if (event?.type === 'approval/asked') {
+        const sid = String(session?.id ?? '')
+        let title
+        try {
+          title = sessionTitle.get(session)?.title ?? undefined
+        } catch {
+          title = undefined
+        }
+        const st = state.get(sid) ?? { runningSince: 0, lastTask: '' }
+        const fallback = st.lastTask
+          ? clip(st.lastTask, TITLE_MAX)
+          : sid
+            ? '会话 …' + (sid.length > 6 ? sid.slice(-6) : sid)
+            : 'DSH 会话'
+        notifyApproval(
+          sid,
+          title ? clip(title, TITLE_MAX) : fallback,
+          st.lastTask,
+          String(event.data?.toolName ?? '未知操作'),
+          event.data?.reason,
+        )
+        return
+      }
       if (event?.type !== 'user/message') return
       if (event.data?.source?.kind !== 'user') return
       const content = event.data.content
@@ -714,25 +761,25 @@ export function apply(ctx, config = {}) {
   // ⚠️ waterfall 链监听器：任何路径都必须返回 next()，否则会否决整条
   // 链（2026-08 事故：不调用 next() 的监听器否决链条其余部分，dsh-tools
   // 读 gate.kind 崩溃）。包括 try/catch 兜底路径。
-  ctx.on('approval/request', (req, next) => {
-    try {
-      const agent = req?.agent
-      const sid = String(agent?.id ?? '')
-      const { title, task } = info(agent)
-      const tool = String(req?.toolName ?? '未知操作')
-      const reason =
-        typeof req?.reason === 'string' && req.reason ? '\n原因：' + clip(req.reason, 120) : ''
-      notify(
-        'approval',
-        sid,
-        '⏸️ ' + title + '：等待批准',
-        '操作：' + tool + reason + (task ? '\n正在执行：' + clip(task, 100) : ''),
-      )
-    } catch {
-      /* 通知失败绝不阻断批准流程 */
-    }
-    return next()
-  })
+  // ⚠️ prepend：必须排在所有应答者之前——真正的应答者（dsh-api-remotes
+  // → GUI 审批弹窗）注册更早，且以用户答复终结链条、不再调用 next()，
+  // 排在其后的观察型监听器永远不会被执行（2026-10-29 起 approval 类
+  // 通知全灭的根因）。本插件永远 next()，不改变审批结果。
+  ctx.on(
+    'approval/request',
+    (req, next) => {
+      try {
+        const agent = req?.agent
+        const sid = String(agent?.id ?? '')
+        const { title, task } = info(agent)
+        notifyApproval(sid, title, task, String(req?.toolName ?? '未知操作'), req?.reason)
+      } catch {
+        /* 通知失败绝不阻断批准流程 */
+      }
+      return next()
+    },
+    { prepend: true },
+  )
 
   // 阻塞：等待回答（ask_user_question）或 plan 模式计划待审批
   // （exit_plan_mode——普通注册工具，执行时阻塞在 userQuestions.ask 的

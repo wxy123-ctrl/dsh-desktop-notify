@@ -53,6 +53,22 @@ web profile 验证多年的同通道），点击跳转保持桌面原生：
 | waterfall 任何路径 `return next()` | 不调用会否决链条，dsh-tools 崩（2026-08 事故） |
 | 路由守卫「Origin 缺席放行」 | 桌面壳转发删除 Origin 头；sysnotify 严格守卫会 403 桌面请求 |
 
+## 审批事件的两条来源（v1.1.2 未发布修订）
+
+「等待批准」通知有**两条来源**，缺一不可：
+
+| 来源 | 事件 | 作用 |
+|---|---|---|
+| 主路径 | 会话事件 `approval/asked` | `ApprovalService.request()` **先**把该事件写进会话日志，**再**去派发 answerers。与瀑布链顺序、作用域过滤均无关 ⇒ 提权申请（`sandbox_permissions`）第一时间弹窗 |
+| 兜底 | waterfall `approval/request` | 以 `{ prepend: true }` 注册，排在**所有**应答者之前被调用；插件永远 `next()`，不改变审批结果 |
+
+**为什么必须改挂会话事件**（2026-10-29 起的失灵根因）：`approval/request` 是
+**waterfall**，真正的应答者（`dsh-api-remotes` → GUI 审批弹窗）在 bundle 顺序上
+先于本插件注册（profile 里 `dsh-web-app` 早于 `dsh-desktop-notify`），且它以用户
+答复终结链条、**不再调用 `next()`** ⇒ 排在其后的观察型监听器**永远不会被执行**
+（连日志行都不会有）。因此 `desktop-notify.log` 里 `kind=approval` 自 2026-10-29
+起为 0 条，而 `done`/`plan`/`question` 照常。
+
 ## 通知内容
 
 | 场景 | 标题 | 正文 |
@@ -87,7 +103,7 @@ React commit 生灭）。
 | `desktop-notify.log` | 诊断日志（加载 / spawn / 入队 / 投递唤醒 / 点击双通道 / 路由异常，无条件落盘） |
 | `package.json` | `dsh.bundle.patch` 声明 bundle 补丁，`dsh.client` 声明浏览器半边 |
 | `cordis.patch.yml` | bundle 补丁：`insert` 行 `{id: desktop-notify, name: dsh-desktop-notify}` |
-| `selftest.mjs` | 自测：`node selftest.mjs`（99 项断言，无 UI 依赖，含真子进程退出码端到端） |
+| `selftest.mjs` | 自测：`node selftest.mjs`（108 项断言，无 UI 依赖，含真子进程退出码端到端） |
 | `locale/zh.json` `locale/en.json` | 插件页（设置 → 内置插件）卡片的中英文标题与描述（`meta.title` / `meta.description`） |
 | `icon.svg` | 插件页卡片图标（package.json 顶层 `icon` 字段声明） |
 
@@ -144,6 +160,14 @@ React commit 生灭）。
 - **误装入浏览器 profile**：client.js 桌面守卫使插件全程 no-op（控制台有
   「非桌面环境」横幅）；宿主半边气泡照弹但点击无法跳转（PS 找不到桌面窗口
   时静默）。
+- **会话不在本插件所在的宿主树里 → 一条通知都不会有**（连「✅ 完成工作」都没有）。
+  宿主半边只观察**同一棵 cordis 树**上的会话事件；若某个会话由另一宿主
+  承载，插件对它完全无感。判据要看「是否出现过 idle 转换」：「✅ 完成工作」
+  需要 running→idle 的状态翻转，长时间停在 running 的会话**不会**有 done
+  通知；多轮下来连 plan/question/approval 都没有 ⇒ 该会话的宿主没装本插件。
+- **审批链上的观察者排在应答者之后 ⇒ 永不执行**（见上「审批事件的两条来源」）。
+  本插件已用会话事件 + `prepend` 双保险规避；第三方插件若只挂
+  `approval/request` 瀑布链而不 `prepend`，在当前版本里不会收到事件。
 - 通知正文超长由 Windows 截断（宿主已截 400 字符）。
 
 ## 操作规程

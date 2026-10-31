@@ -57,11 +57,17 @@ let getTitleCalls = 0
 const fakeLogger = { info: () => {}, warn: () => {}, error: () => {} }
 const makeFakeCtx = () => {
   const listeners = new Map()
+  const listenerOptions = []
   const injectCallbacks = []
   const ctx = {
-    on(name, fn) {
+    on(name, fn, options) {
       if (!listeners.has(name)) listeners.set(name, [])
-      listeners.get(name).push(fn)
+      const list = listeners.get(name)
+      // 镜像 cordis（cordis/src/events.ts:254-259）：options.prepend → unshift。
+      // 审批监听器必须 prepend（排在应答者之前），否则永远轮不到它。
+      if (options && typeof options === 'object' && options.prepend) list.unshift(fn)
+      else list.push(fn)
+      listenerOptions.push({ name, options })
       return () => {}
     },
     inject(names, cb) {
@@ -79,7 +85,7 @@ const makeFakeCtx = () => {
       },
     },
   }
-  return { ctx, listeners, injectCallbacks }
+  return { ctx, listeners, listenerOptions, injectCallbacks }
 }
 
 // 假 webServer：捕获路由注册。A/B 实例共用路由表——后注册者覆盖同路径
@@ -163,7 +169,8 @@ try {
 // 脚本走真子进程（不弹真气泡）。
 const realSpawnToast = testHooks.spawnToast
 let toasts = 0
-testHooks.spawnToast = () => { toasts++ }
+const toastLog = []
+testHooks.spawnToast = (title, body, sid) => { toasts++; toastLog.push({ title, body, sid }) }
 
 // 普通事件：逐个调用，不允许抛异常。
 const fire = (listeners, name, ...args) => {
@@ -222,6 +229,38 @@ fire(A.listeners, 'agent/status', {})
 fireWaterfall(A.listeners, 'approval/request', { agent, toolName: 'pwsh', reason: 'workspace 外写入' })
 fireWaterfall(A.listeners, 'approval/request', undefined)
 fireWaterfall(A.listeners, 'approval/request', { agent, toolName: '' })
+
+// ── 审批主路径：会话事件 approval/asked ─────────────────────────────────
+// 提权申请（sandbox escalation）与工具级审批都走 approval/request 瀑布链；
+// 真正的应答者（GUI 审批弹窗）注册在前且以用户答复终结链条 ⇒ 排在它之后的
+// 观察者永不执行。故主路径改挂持久化会话事件 approval/asked（与瀑布链顺序、
+// 作用域过滤均无关）。
+const askedSid = 'session-approval-asked-1'
+const a0 = toasts
+fire(A.listeners, 'session/event', { id: askedSid }, {
+  type: 'approval/asked',
+  data: { id: 'ask-1', toolName: 'write', callId: 'call-x', reason: 'escalate sandbox to workspace-write: 需要写文件' },
+})
+ok(toasts === a0 + 1, 'approval/asked 会话事件恰好 spawn 1 条气泡')
+const askedToast = toastLog[toastLog.length - 1]
+ok(String(askedToast?.title ?? '').startsWith('⏸️'), 'approval/asked 通知标题带 ⏸️ 前缀')
+ok(String(askedToast?.title ?? '').includes('等待批准'), 'approval/asked 通知标题含「等待批准」')
+ok(String(askedToast?.body ?? '').includes('操作：write'), 'approval/asked 正文含工具名')
+ok(String(askedToast?.body ?? '').includes('原因：escalate sandbox to workspace-write'), 'approval/asked 正文含提权原因')
+ok(askedToast?.sid === askedSid, 'approval/asked 通知的 sid 取会话 id')
+// 同一会话重复 asked → 2.5s 防抖收敛为一条
+fire(A.listeners, 'session/event', { id: askedSid }, {
+  type: 'approval/asked',
+  data: { id: 'ask-2', toolName: 'write', reason: 'escalate sandbox to workspace-write: 再次' },
+})
+ok(toasts === a0 + 1, '同一会话 approval/asked 重复触发 → 防抖只弹一次')
+// 缺字段 / 空负载不得抛错
+fire(A.listeners, 'session/event', { id: 'session-approval-asked-2' }, { type: 'approval/asked' })
+fire(A.listeners, 'session/event', undefined, { type: 'approval/asked', data: {} })
+ok(true, 'approval/asked 缺字段不抛错')
+// 瀑布链监听器必须 prepend（排在应答者之前）
+const approvalOpt = A.listenerOptions.find((o) => o.name === 'approval/request')
+ok(approvalOpt?.options?.prepend === true, 'approval/request 监听器以 prepend 注册（排在应答者之前）')
 
 // ── waterfall：tools/pre-execute（sysnotify 2026-08 事故的案发现场）────
 fireWaterfall(A.listeners, 'tools/pre-execute', { name: 'ask_user_question', agent, arguments: { questions: [{ question: '选择哪个方案？' }] } })
