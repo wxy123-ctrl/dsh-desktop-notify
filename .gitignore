@@ -1,3 +1,4 @@
 node_modules/
 *.log
 notify-prefs.json
+toast-spool.jsonl

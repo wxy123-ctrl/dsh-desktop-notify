@@ -117,6 +117,9 @@ function Focus-DesktopApp {
 	# 取第一个（托盘隐藏态）。最小化 → SW_RESTORE(9)；不可见 → SW_SHOW(5)；
 	# 再 SetForegroundWindow，前台锁未放行时模拟一次 Alt 键解除后重试
 	# （sysnotify 同款技巧）。找不到窗口 → 静默返回（应用已退出）。
+	# v1.3.0 睡眠削减：150→40ms、确认前的 100ms 取消（SetForegroundWindow
+	# 同步返回，紧跟的前台校验已足够，失败有 Alt 重试兜底）——点击到置前
+	# 从 ~300–500ms 降到 ~150–250ms。
 	$wins = Get-DesktopWindows
 	if ($wins.Count -eq 0) { return }
 	$h = [IntPtr]::Zero
@@ -129,9 +132,8 @@ function Focus-DesktopApp {
 	} elseif (-not [Native.Win32]::IsWindowVisible($h)) {
 		[Native.Win32]::ShowWindowAsync($h, 5) | Out-Null  # 5 = SW_SHOW（托盘隐藏）
 	}
-	Start-Sleep -Milliseconds 150
+	Start-Sleep -Milliseconds 40
 	[Native.Win32]::SetForegroundWindow($h) | Out-Null
-	Start-Sleep -Milliseconds 100
 	if ([Native.Win32]::GetForegroundWindow() -ne $h) {
 		[System.Windows.Forms.SendKeys]::SendWait('%')
 		[Native.Win32]::SetForegroundWindow($h) | Out-Null

@@ -28,8 +28,15 @@
 //  12. pickShell 单测（注入假 probe/liveness）：pwsh 找到 → 绝对路径；
 //      未找到 / 存活探针失败（Store 别名失效）→ 回落 powershell.exe（via
 //      判据）；config 缺席与非法值 → 默认；shellText 诊断文案。
+//  13. warm host（v1.3.0）：spool 投递（1 行 JSONL 带 id/token）+ 防抖不写
+//      + 死亡回落逐次 spawn + 超 200 行裁剪末 20；toast-host.ps1 静态断言
+//      （BOM/无隐藏执行/PID 自查/150ms 轮询/基线不回放）。
 // 运行：node D:\TS\dsh-desktop-notify\selftest.mjs
-import { apply as pluginApply, findPwsh, isSubagentSession, loadPrefs, pickShell, savePrefs, shellText, testHooks } from './index.js'
+import { apply as pluginApply, findPwsh, isSubagentSession, loadPrefs, pickShell, savePrefs, shellText, spoolAppend, testHooks } from './index.js'
+// 全程抑制真实 warm host 拉起（apply 的 webServer 注入回调也会触发
+// startWarmHost；selftest 不得启动常驻进程）。warm 通道用 setWarmAlive
+// 强制状态 + tmp spool 验证。
+testHooks.suppressWarmSpawn = true
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -212,6 +219,24 @@ try {
   ok(!isSubagentSession(undefined) && !isSubagentSession({}), '缺会话/缺头 → 非子代理（保守默认）')
   ok(isSubagentSession({ header: { delegationDepth: '2' } }), '字符串深度容忍（持久化层宽松读取）')
   ok(!isSubagentSession({ header: { delegationDepth: 0, parentSession: '' } }), '深度 0 + 空 parent → 主会话')
+
+  // ══ toast-host.ps1 静态断言（常驻气泡进程，v1.3.0）════════════════
+  console.log('—— toast-host.ps1：常驻气泡进程静态断言 ——')
+  const hostPsBytes = readFileSync(fileURLToPath(new URL('./toast-host.ps1', import.meta.url)))
+  ok(hostPsBytes.length > 3 && hostPsBytes[0] === 0xef && hostPsBytes[1] === 0xbb && hostPsBytes[2] === 0xbf,
+    'toast-host.ps1 带 UTF-8 BOM（回落 5.1 时必需）')
+  const hostPsSrc = hostPsBytes.toString('utf8')
+  const hostPsCode = hostPsSrc.split('\n').filter((l) => !l.trimStart().startsWith('#')).join('\n')
+  ok(!hostPsCode.includes('-WindowStyle Hidden') && !hostPsCode.includes('-EncodedCommand'),
+    'toast-host.ps1 代码无隐藏执行特征（火绒纪律；注释引用除外）')
+  ok(hostPsSrc.includes('Get-Process -Id $ParentPid'), 'warm host 自查宿主 PID（宿主退出即退场）')
+  ok(hostPsSrc.includes('$timer.Interval = 150'), 'warm host 150ms UI 线程轮询')
+  ok(hostPsSrc.includes('baseline'), 'warm host 基线机制存在（不回放历史通知）')
+  ok(hostPsSrc.includes('ConvertFrom-Json'), 'warm host 解析 JSONL spool')
+  ok(hostSrc.includes('WARM_RESPAWN_MS'), '宿主侧 warm 重启限流（30s）')
+  ok(hostSrc.includes("writeFileSync(warmSpoolPath, '', 'utf8')"), 'apply 截断 spool（宿主重启 id 归零的配套）')
+  ok(hostSrc.includes('toast spool→warm host'), 'spool 投递诊断行存在')
+  ok(hostSrc.includes('suppressWarmSpawn'), 'warm 拉起可被 selftest 抑制（防真实进程）')
 } catch (err) {
   console.error('FAIL: apply() 抛出异常:', err.stack)
   process.exit(1)
@@ -223,7 +248,8 @@ try {
 const realSpawnToast = testHooks.spawnToast
 let toasts = 0
 const toastLog = []
-testHooks.spawnToast = (title, body, sid) => { toasts++; toastLog.push({ title, body, sid }) }
+const interceptedSpawnToast = (title, body, sid) => { toasts++; toastLog.push({ title, body, sid }) }
+testHooks.spawnToast = interceptedSpawnToast
 
 // 普通事件：逐个调用，不允许抛异常。
 const fire = (listeners, name, ...args) => {
@@ -683,6 +709,51 @@ const run = async () => {
   fire(C.listeners, 'agent/status', { agent: childAgent, status: 'idle' })
   ok(toasts === subOff0 + 1, 'muteSubagents:false → 子代理完成通知恢复（+1）')
 
+  // ══ warm host spool 通道（第四实例，v1.3.0）════════════════════════
+  console.log('—— warm host：spool 投递与回落 ——')
+  const D = makeFakeCtx()
+  const tmpSpool = join(tmpPrefsDir, 'warm-spool.jsonl')
+  pluginApply(D.ctx, { prefsPath: join(tmpPrefsDir, 'd-prefs.json'), spoolPath: tmpSpool })
+  ok(testHooks.warmState().enabled === true, '默认配置启用 warm host（powershell 投递）')
+  ok(testHooks.warmState().spool === tmpSpool, 'spoolPath 配置覆盖生效')
+  testHooks.setWarmAlive(true)
+  testHooks.spawnToast = realSpawnToast // 临时解除拦截：走真实投递单点
+  ok(testHooks.notify('done', 'session-warm-1', '✅ warm 通道', '任务：spool 投递') === true,
+    'warm 存活时 notify → true')
+  testHooks.spawnToast = interceptedSpawnToast // 还原拦截
+  const spoolLines1 = readFileSync(tmpSpool, 'utf8').split('\n').filter((l) => l !== '')
+  ok(spoolLines1.length === 1, 'spool 恰好 1 行（warm 存活 → 不逐次 spawn）')
+  const warmRec = JSON.parse(spoolLines1[0])
+  ok(warmRec.sid === 'session-warm-1' && warmRec.title === '✅ warm 通道' && warmRec.id >= 1
+      && typeof warmRec.token === 'string' && warmRec.token !== '',
+    'spool 记录带 id/title/sid/token')
+  ok(logText().includes('toast spool→warm host'), 'spool 投递写诊断行')
+  testHooks.spawnToast = realSpawnToast
+  ok(testHooks.notify('done', 'session-warm-1', '✅ warm 通道', '重复') === false,
+    '同类同会话 2.5s 防抖 → false')
+  testHooks.spawnToast = interceptedSpawnToast
+  ok(readFileSync(tmpSpool, 'utf8').split('\n').filter((l) => l !== '').length === 1,
+    '防抖命中不写 spool')
+  // warm 死亡 + scriptPath 覆盖 → 绕过 warm 走旧逐次 spawn（不真实拉起）
+  testHooks.setWarmAlive(false)
+  testHooks.scriptPath = psExit0
+  const warmOff0 = toasts
+  testHooks.spawnToast = realSpawnToast
+  realSpawnToast('warm 回退', '走逐次 spawn', 'session-warm-2')
+  testHooks.spawnToast = interceptedSpawnToast
+  ok(toasts === warmOff0, 'warm 死亡 + scriptPath 覆盖 → 绕过 warm 走旧路径')
+  testHooks.scriptPath = undefined
+  // spool 裁剪：灌 205 行 → 首次超 200 时重写保留末 20，其后继续追加
+  let appendOk = 0
+  for (let i = 0; i < 205; i++) if (spoolAppend({ id: 1000 + i, title: 't' + i, body: 'b', sid: 's', token: '', ts: 0 })) appendOk++
+  const spoolFinal = readFileSync(tmpSpool, 'utf8')
+  const finalLines = spoolFinal.split('\n').filter((l) => l !== '')
+  ok(appendOk === 205, '205 次追加全部成功')
+  ok(finalLines.length === 25, 'spool 超 200 行 → 裁剪（1 初始 + 205 灌入 → 末 20 + 其后 5）')
+  ok(spoolFinal.includes('"id":1204') && spoolFinal.includes('"title":"t204"')
+      && !spoolFinal.includes('"title":"t100"'),
+    '裁剪保留的是最新记录（最旧已被丢弃）')
+
   // 收尾断言
   if (getTitleCalls === 0) fail('sessionTitle.get() 从未被调用——标题读取路径失效（误用了幻影 API？）')
   if (toasts === 0) fail('拦截计数为 0——通知链路整体失效')
@@ -697,5 +768,5 @@ run()
       console.error(`\n${failures} 处失败`)
       process.exit(1)
     }
-    console.log('\n全部自测通过 ✅（waterfall + 标题 + 全负载 + 偏好/路由/守卫(无-Origin 放行) + PS 投递/防抖/静音 + 点击长轮询/断连/容量 + notify-click 双通道去重 + 退出码端到端 + renderer 模式 + 子代理默认静音/恢复 + ⏰ 提醒 + PS BOM/进程聚焦 + shell 选择/回落 + client 分发/守卫/样式）')
+    console.log('\n全部自测通过 ✅（waterfall + 标题 + 全负载 + 偏好/路由/守卫(无-Origin 放行) + PS 投递/防抖/静音 + 点击长轮询/断连/容量 + notify-click 双通道去重 + 退出码端到端 + renderer 模式 + 子代理默认静音/恢复 + ⏰ 提醒 + warm host spool/回落/裁剪 + PS BOM/进程聚焦 + shell 选择/回落 + client 分发/守卫/样式）')
   })
