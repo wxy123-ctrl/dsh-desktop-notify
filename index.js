@@ -36,10 +36,8 @@
 //     param() 解析崩、静默失败；selftest 有 BOM 断言）
 //   · spawn 只用 {stdio:'ignore'}——detached/windowsHide 会让 NotifyIcon
 //     气泡消失（DETACHED_PROCESS 迫使子进程新建隐藏控制台，实测致命）
-//   · 通知进程默认 powershell.exe（每台 Windows 必有，市场分发零依赖）；
-//     config.shell 'pwsh' / 'auto' 切 pwsh 7——where.exe 定位 + 启动存活
-//     探针，找不到/起不来一律回落 powershell.exe（toast-notify.ps1 两个
-//     版本语法兼容，带 BOM，两版都要求明文 -File 调用）
+//   · 通知进程固定 powershell.exe（5.1）：每台 Windows 必有；v1.2–v1.3.2 的
+//     pwsh 选择机制已移除（Store 执行别名探测三连败 + 功能等价收益为零）
 //
 // ⚠️ 路由同源守卫与 sysnotify 不同：桌面壳把 dsh-app://app 页面的请求经
 // protocol.handle 转发给宿主 HTTP 时会【删除 Origin 头】（壳持有认证 cookie，
@@ -64,15 +62,13 @@
 // notify-prefs.json（{"muted":[sessionId…]}，缺席 = 开启，默认开启），notify()
 // 单点门控——静音会话的全部 5 类通知都不投递。
 
-import { spawn, spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const TOAST_SCRIPT = fileURLToPath(new URL('./toast-notify.ps1', import.meta.url))
-const TOAST_HOST_SCRIPT = fileURLToPath(new URL('./toast-host.ps1', import.meta.url))
-const TOAST_SPOOL = fileURLToPath(new URL('./toast-spool.jsonl', import.meta.url))
 const NOTIFY_LOG = fileURLToPath(new URL('./desktop-notify.log', import.meta.url))
 const DEFAULT_PREFS_PATH = fileURLToPath(new URL('./notify-prefs.json', import.meta.url))
 
@@ -133,229 +129,6 @@ const pendingToasts = new Map()
  *  PS 点击只聚焦窗口不发信号（页面轮询通道不可用时的退化行为）。 */
 let clickUrl = ''
 
-/** 通知进程：apply() 时经 pickShell() 解析（默认 'powershell.exe'）。 */
-let toastShell = 'powershell.exe'
-
-/** where.exe 定位 pwsh（取首个非空行；有效性交给 findPwsh 的 pathPresent
- *  与存活探针——不在此做 stat：WindowsApps 执行别名会被 stat/existsSync 以
- *  EACCES 拒掉，v1.2.0–v1.3.0「pwsh 未找到」误诊为 PATH 问题的真凶正是它，
- *  2026-11-01 实测：lstatSync 通过、statSync EACCES、spawnSync status=0）。 */
-function wherePwsh() {
-  try {
-    const r = spawnSync('where.exe', ['pwsh'], { timeout: 5000, windowsHide: true })
-    if (r.error || r.status !== 0) return null
-    const line = String(r.stdout ?? '')
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .find((s) => s !== '')
-    return line && line !== '' ? line : null
-  } catch {
-    return null
-  }
-}
-
-/** 路径存在性（lstat 语义）：执行别名（APPEXECLINK 重解析点）stat 会
- *  EACCES，lstat 看条目本身 ⇒ 判定存在；真缺失抛 ENOENT ⇒ 不存在。
- *  最终能否用仍由 pwshAlive 的真 spawn 探针裁决。 */
-function pathPresent(p) {
-  try {
-    lstatSync(p)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/** %LOCALAPPDATA%（宿主 env 可能被剥——PATH 已证实缺用户级条目）；
- *  缺失时用 os.homedir() 拼标准位置（homedir 走 Win32 API 兜底，不依赖 env）。 */
-function localAppDir() {
-  const env = process.env.LOCALAPPDATA
-  if (typeof env === 'string' && env !== '') return env
-  return homedir() + '\\AppData\\Local'
-}
-
-/** pwsh 候选探测报告（仅诊断用：未找到/探针失败时记一行，不再猜原因）。 */
-export function pwshProbeReport(exists = pathPresent, where = wherePwsh) {
-  const alias = localAppDir() + '\\Microsoft\\WindowsApps\\pwsh.exe'
-  return {
-    localapp: localAppDir(),
-    alias: exists(alias),
-    msi: exists('C:\\Program Files\\PowerShell\\7\\pwsh.exe'),
-    msiPreview: exists('C:\\Program Files\\PowerShell\\7-preview\\pwsh.exe'),
-    where: where(),
-  }
-}
-
-/** pwsh 启动存活探针：Store 版别名失效（卸载/损坏）时 spawnSync 报错或
- *  起不来——这种 pwsh 一条通知都弹不出，必须当场回落 5.1。 */
-function pwshAlive(path) {
-  try {
-    const r = spawnSync(path, ['-NoProfile', '-Command', 'exit 0'], {
-      timeout: 5000,
-      stdio: 'ignore',
-      windowsHide: true,
-    })
-    return !(r.error || r.status !== 0)
-  } catch {
-    return false
-  }
-}
-
-/** 按优先级找 pwsh：① %LOCALAPPDATA%（缺失时 homedir 拼兜底）下的
- *  WindowsApps\pwsh.exe（Store 版别名——不依赖宿主 PATH）②③ MSI 标准
- *  路径（x64 / preview）④ where.exe（PATH 兜底）。exists / where 可注入
- *  （selftest）；默认 exists 是 lstat 语义（见 pathPresent）。 */
-export function findPwsh(exists = pathPresent, where = wherePwsh) {
-  const list = [localAppDir() + '\\Microsoft\\WindowsApps\\pwsh.exe']
-  list.push('C:\\Program Files\\PowerShell\\7\\pwsh.exe')
-  list.push('C:\\Program Files\\PowerShell\\7-preview\\pwsh.exe')
-  const hit = where()
-  if (typeof hit === 'string' && hit !== '') list.push(hit)
-  for (const p of list) {
-    try {
-      if (exists(p)) return p
-    } catch {
-      /* 单个候选探测失败继续下一个 */
-    }
-  }
-  return null
-}
-
-/** 解析通知进程：'powershell'（默认/非法值）→ powershell.exe；'pwsh' /
- *  'auto' → 探测 pwsh，找不到（pwsh-not-found）或起不来（pwsh-probe-
- *  failed）一律回落 powershell.exe。probe / liveness 可注入（selftest）。
- *  返回 { shell, via }，via 供诊断日志区分「用了 pwsh」与「回落」。 */
-export function pickShell(shellConfig, probe = () => findPwsh(), liveness = pwshAlive) {
-  if (shellConfig !== 'pwsh' && shellConfig !== 'auto') {
-    return { shell: 'powershell.exe', via: 'default' }
-  }
-  const path = probe()
-  if (typeof path !== 'string' || path === '') {
-    return { shell: 'powershell.exe', via: 'pwsh-not-found' }
-  }
-  if (!liveness(path)) {
-    return { shell: 'powershell.exe', via: 'pwsh-probe-failed' }
-  }
-  return { shell: path, via: 'pwsh' }
-}
-
-/** 加载诊断行里的 shell 描述（selftest 断言判据）。 */
-export function shellText(pick) {
-  if (pick.via === 'pwsh') return 'pwsh @ ' + pick.shell
-  if (pick.via === 'pwsh-not-found') return 'powershell.exe（pwsh 未找到，已回落）'
-  if (pick.via === 'pwsh-probe-failed') return 'powershell.exe（pwsh 探针失败，已回落）'
-  return 'powershell.exe'
-}
-
-// ── 常驻气泡进程（warm host，v1.3.0）────────────────────────────────────
-//
-// 每条通知冷启 PowerShell（自载 .NET + Add-Type 运行时编译）要 400–1500ms，
-// 是气泡延迟的大头。warm host 把这套成本摊销：加载（或首条通知）时拉起一个
-// 常驻 toast-host.ps1，脚本预热好 WinForms/P-Invoke 后以 150ms UI 线程定时
-// 器轮询 toast-spool.jsonl 增量，新记录 100–250ms 内成泡；点击聚焦不再付
-// 编译成本（睡眠也已削减）。宿主侧只往 spool 追加 JSON 行；warm host 死亡
-// /未启用/写盘失败时自动回落旧逐次 spawn 路径（toast()），通知不灭。
-// 宿主退出由脚本自查 -ParentPid 兜底（Windows 子进程不随父进程终止）。
-
-/** warm host 状态（apply() 配置；selftest 经 testHooks 注入）。 */
-let warmEnabled = false
-let warmAlive = false
-let warmSpoolPath = '' // 空串 = 未配置（deliverToast 直接走回落）
-let warmChild = null
-let warmLastStart = 0
-const WARM_RESPAWN_MS = 30_000 // 拉起失败后的重启限流（防死循环 spawn）
-
-/** 拉起 warm host（幂等 + 限流）。stdio 仍只用 'ignore'（隐藏控制台会杀
- *  气泡，实测纪律）；命令行明文 -File + 具名参数。testHooks.suppressWarmSpawn
- *  置位时绝不真实拉起（selftest：webServer 注入回调也会走到这里）。 */
-function startWarmHost(reason) {
-  if (!warmEnabled || warmAlive || testHooks.suppressWarmSpawn) return
-  if (Date.now() - warmLastStart < WARM_RESPAWN_MS) return
-  warmLastStart = Date.now()
-  try {
-    const args = [
-      '-NoProfile',
-      '-ExecutionPolicy', 'Bypass',
-      '-File', TOAST_HOST_SCRIPT,
-      '-Spool', warmSpoolPath,
-      '-ParentPid', String(process.pid),
-    ]
-    if (clickUrl !== '') args.push('-ClickUrl', clickUrl)
-    const child = spawn(toastShell, args, { stdio: 'ignore' })
-    warmChild = child
-    warmAlive = true
-    child.on('error', (e) => {
-      warmAlive = false
-      diag('warm host 启动失败: ' + (e?.message ?? String(e)))
-    })
-    child.on('exit', (code) => {
-      warmAlive = false
-      diag('warm host 退出 code=' + code + '（后续通知回落逐次 spawn，30s 内不重启）')
-    })
-    child.unref()
-    diag('warm host 已启动（' + reason + '）shell=' + toastShell + ' pid=' + child.pid)
-  } catch (err) {
-    warmAlive = false
-    diag('warm host 异常: ' + (err?.message ?? String(err)))
-  }
-}
-
-/** spool 追加一行 JSON 记录；超 200 行重写保留末 20 行（JSON 序列化已转义
- *  换行，行数即记录数；重写变短会让 warm host 重建基线不重弹）。
- *  返回 false = 写盘失败（调用方回落逐次 spawn）。 */
-export function spoolAppend(record) {
-  try {
-    appendFileSync(warmSpoolPath, JSON.stringify(record) + '\n', 'utf8')
-    const text = readFileSync(warmSpoolPath, 'utf8')
-    const lines = text.split('\n').filter((l) => l !== '')
-    if (lines.length > 200) {
-      writeFileSync(warmSpoolPath, lines.slice(-20).join('\n') + '\n', 'utf8')
-    }
-    return true
-  } catch {
-    return false
-  }
-}
-
-let spoolSeq = 0 // spool 记录序号（宿主重启归零 ⇒ apply() 截断 spool 配合基线重建）
-
-/** warm 子进程实查存活：2026-11-01 实测进程可无声消失（exit/error 事件均
- *  未触发——疑似 Job 对象/安全软件击杀），warmAlive 标志假真会让通知进
- *  spool 成黑洞。信号 0 只探测进程存在性，零成本。 */
-function warmChildAlive() {
-  const child = warmChild
-  if (child === null || child === undefined) return false
-  if (child.exitCode !== null || child.signalCode !== null) return false
-  try {
-    process.kill(child.pid, 0)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/** 投递单点：warm 存活（实查）→ 追加 spool；否则回落旧逐次 spawn（并尝试
- *  拉起 warm）。testHooks.scriptPath 覆盖期间（selftest 真 spawn 用例）不经
- *  warm——那些用例正是要验证逐次 spawn 的退出码通道。 */
-function deliverToast(title, body, sid) {
-  if (warmEnabled && warmSpoolPath !== '' && testHooks.scriptPath === undefined) {
-    if (warmAlive && !warmChildAlive()) {
-      warmAlive = false
-      diag('warm host 疑似死亡（pid 实查失败），本条回落逐次 spawn')
-    }
-    if (warmAlive) {
-      const id = ++spoolSeq
-      const token = sid !== '' ? randomUUID() : ''
-      if (spoolAppend({ id, title, body, sid, token, ts: Date.now() })) {
-        diag('toast spool→warm host id=' + id + ' sid=' + sid + ' title=' + clip(title, 80))
-        return
-      }
-      diag('spool 写盘失败，回落逐次 spawn')
-    }
-  }
-  if (warmEnabled && testHooks.scriptPath === undefined) startWarmHost('投递时未存活')
-  toast(title, body, sid)
-}
 
 /** 提取 user/message 事件的文本内容（string 或 text parts 拼接；空 = 无文本）。 */
 function messageText(event) {
@@ -406,7 +179,7 @@ function toast(title, body, sessionId) {
       // 不需要——它们正是用来验证退出码兜底通道的）。
       args.push('-SessionId', sid, '-ClickToken', token, '-ClickUrl', clickUrl)
     }
-    const child = spawn(toastShell, args, { stdio: 'ignore' })
+    const child = spawn('powershell.exe', args, { stdio: 'ignore' })
     if (sid !== '') pendingToasts.set(child, { sid, token })
     const forget = () => pendingToasts.delete(child)
     child.on('error', (e) => {
@@ -441,31 +214,16 @@ function toast(title, body, sessionId) {
 }
 
 /** 测试缝隙：selftest 用。
- *  spawnToast：投递单点（warm 存活走 spool，否则逐次 spawn；selftest 拦截
- *    成计数器，测试过程不连环弹窗；真子进程端到端用 scriptPath 指向临时
- *    exit-N 脚本走真 spawn）；
+ *  spawnToast：真实气泡入口（selftest 拦截成计数器，测试过程不连环弹窗；
+ *    真子进程端到端用 scriptPath 指向临时 exit-N 脚本走真 spawn）；
  *  notify：直调通知入口；emitClick：直调入队路径；
- *  queueDepth：断言队列深度；scriptPath：覆盖 PS 脚本路径（非 undefined
- *    时 deliverToast 绕过 warm 直走逐次 spawn）；
- *  warmState / setWarmAlive：观察与强制 warm 存活态（spool 路径单测）。 */
+ *  queueDepth：断言队列深度；scriptPath：覆盖 PS 脚本路径。 */
 export const testHooks = {
-  spawnToast: (title, body, sessionId) => deliverToast(title, body, sessionId),
+  spawnToast: (title, body, sessionId) => toast(title, body, sessionId),
   scriptPath: undefined,
   notify: (kind, sessionId, title, body) => enqueueNotify(kind, sessionId, title, body),
   emitClick: (sessionId, token) => emitClick(sessionId, token),
   queueDepth: () => 0,
-  warmState: () => ({ enabled: warmEnabled, alive: warmAlive, spool: warmSpoolPath }),
-  setWarmAlive: (v) => {
-    warmAlive = v
-    // 播种/清除假 child：warmChildAlive() 的 pid 实查要有对象可查
-    // （pid=自身 ⇒ 信号 0 探测恒通过）。仅 selftest 使用；生产路径
-    // warmChild 由 startWarmHost 的真实 spawn 赋值。
-    warmChild = v
-      ? { pid: process.pid, exitCode: null, signalCode: null, kill() {} }
-      : null
-  },
-  /** selftest 置 true：阻断真实 warm host 拉起（含 webServer 注入回调路径）。 */
-  suppressWarmSpawn: false,
 }
 
 // ── 会话级静音偏好（notify-prefs.json）──────────────────────────────────
@@ -543,55 +301,9 @@ export function apply(ctx, config = {}) {
   // config.delivery：投递通道。'powershell'（默认——渲染器 Web Notifications
   // 在当前桌面端构建被 Windows 静默丢弃，见文件头）/ 'renderer'（预留，
   // 桌面端未来补上 app.setAppUserModelId 后启用）。非法值回落 powershell。
+  // 通知进程固定 powershell.exe（5.1）：每台 Windows 必有、脚本功能与 7 等价
+  // （v1.2–v1.3 的 shell 选择机制已移除——Store 版别名探测三连败，收益为零）。
   const delivery = config.delivery === 'renderer' ? 'renderer' : 'powershell'
-  // config.shell：通知进程。'powershell'（默认，每台 Windows 必有）/
-  // 'pwsh'（pwsh 7，找不到/起不来回落 5.1 并记日志）/'auto'（pwsh 优先，
-  // 回落静默）。解析在加载期一次完成，toast() 只消费结果。
-  const shellPick = pickShell(config.shell)
-  toastShell = shellPick.shell
-  if (shellPick.via !== 'pwsh' && shellPick.via !== 'default') {
-    // 探测失败附候选判定摘要（2026-11-01 教训：existsSync 误杀 Store 别名
-    // 被误诊为 PATH 问题——以后看日志不用猜）。
-    try {
-      diag('pwsh 探测详情 ' + JSON.stringify(pwshProbeReport()))
-    } catch {
-      /* 报告失败不影响主流程 */
-    }
-  }
-  // config.warmHost（默认 true，仅 powershell 投递）：常驻气泡进程，免掉
-  // 每条通知冷启 PowerShell。config.spoolPath：测试用覆盖；默认本目录
-  // toast-spool.jsonl。每次 apply 截断 spool：宿主重启后 spoolSeq 归零，
-  // 新记录 id 从 1 开始——不截断会被旧基线遮蔽（残留的旧 warm host 也会
-  // 因文件变短重建基线，双保险）。
-  warmEnabled = delivery === 'powershell' && config.warmHost !== false
-  warmAlive = false
-  warmChild = null
-  warmSpoolPath =
-    typeof config.spoolPath === 'string' && config.spoolPath !== ''
-      ? resolve(config.spoolPath)
-      : TOAST_SPOOL
-  if (warmEnabled) {
-    try {
-      writeFileSync(warmSpoolPath, '', 'utf8')
-    } catch {
-      warmEnabled = false // spool 写不进（只读目录等）→ 整体退回逐次 spawn
-      diag('warm host 停用：spool 写盘失败')
-    }
-  }
-  ctx.effect(
-    () => () => {
-      // 插件停用/重挂：杀掉 warm host（HMR 重挂会重建）+ 关闭 warm 通道。
-      try {
-        warmChild?.kill()
-      } catch {
-        /* already gone */
-      }
-      warmChild = null
-      warmAlive = false
-      warmEnabled = false
-    },
-    'dsh-desktop-notify: warm host detach',
-  )
   const muted = loadPrefs(prefsPath)
   // config.muteSubagents：AI 拉起的子代理会话（header.parentSession 存在
   // 或 delegationDepth ≥ 1）全部 6 类通知默认静音；主会话不受影响。
@@ -615,15 +327,7 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  diag(
-    '插件已加载（v1.3.1，投递 ' +
-      delivery +
-      '，shell ' +
-      shellText(shellPick) +
-      '，静音 ' +
-      muted.size +
-      ' 个会话），注册事件监听器',
-  )
+  diag('插件已加载（v1.4.0，投递 ' + delivery + '，静音 ' + muted.size + ' 个会话），注册事件监听器')
   const sessionTitle = ctx.sessionTitle
 
   // ── 事件队列（长轮询投递）────────────────────────────────────────────
@@ -739,7 +443,7 @@ export function apply(ctx, config = {}) {
     const clippedTitle = clip(title, NOTIF_TITLE_MAX)
     const clippedBody = clip(String(body ?? ''), NOTIF_BODY_MAX)
     if (delivery === 'powershell') {
-      diag('notify kind=' + kind + ' sid=' + sid + ' 投递 toast title=' + clip(clippedTitle, 80))
+      diag('notify kind=' + kind + ' sid=' + sid + ' spawn toast title=' + clip(clippedTitle, 80))
       testHooks.spawnToast(clippedTitle, clippedBody, sid)
       try {
         ctx.logger?.info?.('desktop-notify:', clippedTitle, '—', clippedBody.replace(/\n/g, ' '))
@@ -822,8 +526,6 @@ export function apply(ctx, config = {}) {
     // 0.0.0.0 监听时 PS/页面都走 127.0.0.1。
     const host = wctx.webServer.host === '0.0.0.0' ? '127.0.0.1' : wctx.webServer.host
     clickUrl = `http://${host}:${wctx.webServer.port}/plugins/dsh-desktop-notify/notify-click`
-    // clickUrl 就绪即可拉起 warm host（常驻进程需要它传点击信号参数）。
-    startWarmHost('webServer')
     wctx.effect(
       () => {
         const disposePref = wctx.webServer.register({

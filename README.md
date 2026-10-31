@@ -24,15 +24,15 @@ web profile 验证多年的同通道），点击跳转保持桌面原生：
 
 ```
 宿主半边 index.js（desktop profile 内，纯 Node）
+宿主半边 index.js（desktop profile 内，纯 Node）
   6 类事件 → 子代理默认静音门 + 用户静音门 + 2.5s 防抖（文案/标题与 sysnotify 相同）
-  →【delivery: powershell（默认）】warm host（v1.3.0 默认）：toast-spool.jsonl
-    追加一行 → 常驻 toast-host.ps1 150ms 轮询增量 → 气泡 100–250ms；warm
-    死亡/停用时回退逐次 spawn powershell/pwsh -File toast-notify.ps1
-    -Title -Body（U+2028 载体换行）-SessionId -ClickToken -ClickUrl
+  →【delivery: powershell（默认）】spawn powershell.exe -NoProfile
+    -ExecutionPolicy Bypass -File toast-notify.ps1 -Title -Body
+    （U+2028 载体换行）-SessionId -ClickToken -ClickUrl
   →【delivery: 'renderer'（预留）】入队 type:'notify' 事件 → 页面长轮询 →
     client.js new Notification()（未来桌面端补上 AUMID 后启用）
 
-点击气泡 → toast-host.ps1（warm）/ toast-notify.ps1（回退）：
+点击气泡 → toast-notify.ps1：
   ① Send-ClickSignal：POST {sessionId, token} 到 notify-click 路由
     （HttpWebRequest + Proxy=$null + 1s 超时；token 去重）
     → 宿主入队 type:'click' 事件 → 唤醒页面长轮询
@@ -40,10 +40,8 @@ web profile 验证多年的同通道），点击跳转保持桌面原生：
   ② 聚焦 DSH 桌面窗口：EnumWindows 按进程名 "DeepSeek Harness" 定位
     （不限可见——托盘隐藏窗口 IsWindowVisible=false）→ SW_RESTORE（最小化）
     / SW_SHOW（托盘隐藏）→ SetForegroundWindow（前台锁未放行时 Alt 键重试）
-  ③ 回退路径 exit 0（已点击）/ exit 3（未点击超时）；exit 0 时宿主按
-     child→{sid,token} 记账走退出码兜底通道，与 HTTP 通道按 token 去重，
-     先到者生效。warm host 不退出：点击 → 信号 + 聚焦 → 销毁图标继续轮询
-```
+  ③ exit 0（已点击）/ exit 3（未点击超时）；exit 0 时宿主按 child→{sid,token}
+    记账走退出码兜底通道，与 HTTP 通道按 token 去重，先到者生效
 
 与 sysnotify（浏览器版）相比删除了：UIA 页签匹配、实时标题集（notify-titles）、
 开新页兜底——桌面端只有一个 Electron 主窗口，按进程名定位即可。
@@ -55,53 +53,6 @@ web profile 验证多年的同通道），点击跳转保持桌面原生：
 | spawn 只用 `{stdio:'ignore'}` | detached/windowsHide 会让 NotifyIcon 气泡消失（实测致命） |
 | waterfall 任何路径 `return next()` | 不调用会否决链条，dsh-tools 崩（2026-08 事故） |
 | 路由守卫「Origin 缺席放行」 | 桌面壳转发删除 Origin 头；sysnotify 严格守卫会 403 桌面请求 |
-
-## 通知用哪个 PowerShell：5.1 vs 7（v1.3.1）
-
-气泡脚本只用两版公共语法（WinForms NotifyIcon、P/Invoke、HttpWebRequest），
-`powershell.exe`（5.1）与 `pwsh.exe`（7）**功能完全等价**（已在 7.6 实测：
-脚本 0 语法错误、WinForms/SystemIcons 正常加载）。差异在选择哪个：
-
-| 维度 | powershell.exe 5.1（默认） | pwsh.exe 7 |
-|---|---|---|
-| 可用性 | 每台 Windows 必有 | 需另行安装（MSI / Microsoft Store） |
-| 启动（每条通知 spawn 一次） | ~200–400ms | ~400–900ms（自载 .NET；Store 版别名再略慢） |
-| 无 BOM 的 UTF-8 脚本 | 按 GBK 误读 → 崩（本插件 BOM 纪律的由来） | 默认 UTF-8（本插件仍带 BOM，两版兼容） |
-| 运行时 | 冻结，仅维护 | 活跃演进（三元、`??`、并行等备用） |
-| 适合谁 | 市场分发——别人机器零依赖 | 想与 DSH 自身用壳一致 / 偏好新运行时 |
-
-切换（profile 的 `cordis.patch.yml`，与 `delivery` 同一覆盖机制）：
-
-```yaml
-- id: desktop-notify
-  config:
-    shell: pwsh       # 默认 powershell；'auto' = pwsh 优先、回落静默
-```
-
-解析在**加载期一次完成**，候选按优先级（v1.3.1 修正）：
-
-1. `%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`（Store 版别名——不依赖
-   PATH；LOCALAPPDATA 缺失时用 `os.homedir()` 拼兜底）
-2. `C:\Program Files\PowerShell\7\pwsh.exe` / `7-preview\pwsh.exe`（MSI 标准路径）
-3. `where.exe pwsh`（PATH 兜底）
-
-⚠️ **存在性判定用 lstat 语义**（v1.3.1 真凶修复）：Node 的 `existsSync`/
-`statSync` 对 WindowsApps 执行别名（APPEXECLINK 重解析点）返回 **EACCES**，
-v1.2.0–v1.3.0 的「pwsh 未找到，已回落」正是它——Store 版装了也探测不到，
-曾误诊为宿主 PATH 问题（PATH 确实也缺用户级目录，但不是主因）。
-
-首个**lstat 可见**的候选再过**启动存活探针**（`-NoProfile -Command exit 0`，
-5s 超时）——起不来（如别名失效、pwsh 被卸载）**一律回落 powershell.exe**，
-通知不灭；失败时日志附 `pwsh 探测详情 {alias,msi,msiPreview,where}` 判定
-摘要。`desktop-notify.log` 加载行即判据：
-
-- `shell pwsh @ C:\…\pwsh.exe`（用上了 pwsh）
-- `shell powershell.exe（pwsh 未找到，已回落）` / `（pwsh 探针失败，已回落）`
-- `shell powershell.exe`（默认）
-
-运行中 pwsh 被卸载：该次 spawn 记 `toast spawn 失败`（既有日志兜底），下次
-重启宿主自动回落。另：通知中心的归组名会随所用 exe 变化（5.1 显示
-Windows PowerShell；7 显示 PowerShell）。
 
 ## 审批事件的两条来源（v1.2.0）
 
@@ -166,14 +117,12 @@ React commit 生灭）。
 |---|---|
 | `index.js` | 宿主半边：事件监听 + 防抖/静音 + PS spawn + 点击队列 + notify-pref / notify-events / notify-click 三条路由 |
 | `client.js` | 桌面渲染器半边：桌面守卫 + 长轮询按 type 分发（click→openSession / notify→渲染器通知）+ 闹钟开关按钮 |
-| `toast-notify.ps1` | 气泡脚本（逐次 spawn 回退路径）：NotifyIcon + 点击（HTTP 信号 + 聚焦 Electron 窗口）+ exit 0/3（**UTF-8 with BOM**） |
-| `toast-host.ps1` | 常驻气泡进程（warm host，v1.3.0 默认）：预热 WinForms/P-Invoke 后 150ms 轮询 spool 增量弹泡；自查宿主 PID 退场（**UTF-8 with BOM**） |
-| `toast-spool.jsonl` | warm host 投递队列（运行时生成，gitignore；宿主 apply 时截断，超 200 行裁剪末 20） |
+| `toast-notify.ps1` | 气泡脚本：NotifyIcon + 点击（HTTP 信号 + 聚焦 Electron 窗口）+ exit 0/3（**UTF-8 with BOM**） |
 | `notify-prefs.json` | 会话级静音偏好（运行时生成，可手编；缺席 = 开启） |
 | `desktop-notify.log` | 诊断日志（加载 / spawn / 入队 / 投递唤醒 / 点击双通道 / 路由异常，无条件落盘） |
 | `package.json` | `dsh.bundle.patch` 声明 bundle 补丁，`dsh.client` 声明浏览器半边 |
 | `cordis.patch.yml` | bundle 补丁：`insert` 行 `{id: desktop-notify, name: dsh-desktop-notify}` |
-| `selftest.mjs` | 自测：`node selftest.mjs`（170 项断言，无 UI 依赖，含真子进程退出码端到端） |
+| `selftest.mjs` | 自测：`node selftest.mjs`（129 项断言，无 UI 依赖，含真子进程退出码端到端） |
 | `locale/zh.json` `locale/en.json` | 插件页（设置 → 内置插件）卡片的中英文标题与描述（`meta.title` / `meta.description`） |
 | `icon.svg` | 插件页卡片图标（package.json 顶层 `icon` 字段声明） |
 
@@ -205,62 +154,30 @@ React commit 生灭）。
     delivery: renderer   # 默认 powershell
 ```
 
-## 常驻气泡进程（warm host，v1.3.0+ 默认开启）
-
-每条通知冷启 PowerShell（自载 .NET + Add-Type 运行时编译）要 **400–1500ms**，
-是气泡延迟的大头。v1.3.0 起默认改用常驻进程摊销：
-
-```
-notify() → toast-spool.jsonl 追加一行 {id,title,body,sid,token}
-  → toast-host.ps1（常驻，预热 WinForms/P-Invoke）150ms UI 线程定时器轮询增量
-  → 新记录 100–250ms 内弹 NotifyIcon 气泡；点击 → HTTP 信号 + 聚焦（已无编译
-    成本，睡眠也削减到 40ms → 点击到置前 ~150–250ms）
-```
-
-- **生命周期**：加载时（webServer 就绪）或首条通知拉起；每 ~6s 自查宿主
-  PID，宿主退出即退场；插件停用/重挂时杀掉重建。崩溃/被杀 → 下条通知自动
-  回落**逐次 spawn**（toast-notify.ps1 旧路径），30s 内不重启（防死循环）。
-  **投递前 pid 实查**（v1.3.1）：进程可能无声消失（exit 事件不触发，疑似
-  Job 对象/安全软件击杀）——每次投递前用信号 0 探测，死了当场回落，
-  `warmAlive` 标志不再被信任为唯一依据。
-- **基线不回放**：启动/文件变短时只记现有最大 id 不弹历史；宿主重启后
-  spoolSeq 归零 ⇒ apply 时截断 spool 配套（残留 warm host 也会因变短重建基线）。
-  ⚠️ v1.3.1 修复：**空 spool 启动时基线必须立即成立**——v1.3.0 空文件分支
-  不置位，宿主重启后的**第一条通知被当历史静默吞掉**（2026-11-01「通知完全
-  不见」事故的直接根因，日志表现为 `spool→warm host` 有行而无气泡）。
-- **退出**：`config: { warmHost: false }` 一键退回逐次 spawn；spool 写不进
-  （只读目录等）也会自动整体退回。
-- ⚠️ **安全软件注意**：命令行纪律不变（明文 `-File` + 具名参数，无隐藏
-  执行特征），但进程从「秒退」变「常驻」——若你的安全软件有「PowerShell
-  常驻/注入」类行为规则，放行 `toast-host.ps1` 或设 `warmHost: false`。
-- 常驻 pwsh 内存 ~60–120MB（5.1 约 ~40–80MB）；多宿主同目录共享一个 spool
-  属超纲场景（单宿主桌面端为设计前提）。
-
 ## 排障（按投递链三环）
 
-1. **宿主环**：`desktop-notify.log` 应有「插件已加载（v1.3.1，投递
-   powershell，shell …，静音 N 个会话）」+「warm host 已启动（webServer）
-   …pid=N」；触发事件后有 `notify kind=… 投递 toast` 行。没有 → 事件未到或宿主半边
-   未加载（确认 bundle 注册 + 已重启桌面端）。shell 段显示「已回落」→
-   config.shell 指向的 pwsh 不可用（未装/别名失效），已自动用 5.1 兜底，
-   通知不受影响。
-2. **气泡环**：warm 模式看「toast spool→warm host id=…」行 + `warm host
-   退出 code=…`（退出后回落逐次 spawn）。有 `spool→warm host` 行而无气泡 →
-   warm host 存活但气泡被环境吞（确认进程表里 shell 进程在跑；重启宿主后
-   第一条通知必弹是 v1.3.1 的验收红线）；`warm host 疑似死亡（pid 实查
-   失败）` → 进程无声消失已自动回落，重复出现查安全软件/Job 对象。逐次
-   spawn 模式出现 `toast 进程退出码 N`（N≠3）→ PS 脚本执行失败（检查
-   BOM / 安全软件拦截记录）；`toast spawn 失败` → 所选 shell 可执行文件
-   起不来（pwsh 运行中被卸载等，重启宿主自动回落）。
-3. **点击环**：点击气泡后 log 应有 `notify-click HTTP 信号 sid=…`（warm
-   模式只有 HTTP 通道；逐次 spawn 模式另有 `toast 点击（退出码通道）` 兜底）
-   + `notify-events 点击投递 …唤醒 1 个等待请求`；桌面端 DevTools 控制台
-   `[dsh-desktop-notify] 事件到达 click <sid>`。窗口没切 → 对比控制台有无
-   `openSession 失败` 警告；页面轮询死 → 确认横幅
-   `[dsh-desktop-notify] v1.3.1 事件长轮询已启动` 存在，刷新窗口一次。
+1. **宿主环**：`desktop-notify.log` 应有「插件已加载（v1.4.0，投递
+   powershell，静音 N 个会话）」；触发事件后有 `notify kind=… spawn toast`
+   行。没有 → 事件未到或宿主半边未加载（确认 bundle 注册 + 已重启桌面端）。
+2. **气泡环**：log 出现 `toast 进程退出码 N`（N≠3）→ PS 脚本执行失败
+   （检查 BOM / 安全软件拦截记录）；`toast spawn 失败` → powershell.exe
+   起不来（极少见——它是系统组件）。
+3. **点击环**：点击气泡后 log 应有 `notify-click HTTP 信号 sid=…`（或
+   `toast 点击（退出码通道）sid=…` 兜底）+ `notify-events 点击投递 …唤醒 1 个
+   等待请求`；桌面端 DevTools 控制台 `[dsh-desktop-notify] 事件到达 click
+   <sid>`。窗口没切 → 对比控制台有无 `openSession 失败` 警告；页面轮询死 →
+   确认横幅 `[dsh-desktop-notify] v1.4.0 事件长轮询已启动` 存在，刷新窗口一次。
 
 ## 已知边界
 
+- **通知进程固定 powershell.exe（5.1）**：每台 Windows 必有、零探测成本。
+  v1.2–v1.3.2 曾支持 pwsh 7 选择，因 Store 执行别名在宿主内探测三连败
+  （existsSync EACCES / lstat 不可见 / spawn 探针是唯一可靠判据）且功能
+  完全等价收益为零，v1.4.0 移除——通知归组名恒为 Windows PowerShell 属预期。
+- **气泡延迟 ~0.5s**（每条通知冷启一个 PowerShell 的固有成本）。v1.3 曾用
+  常驻 warm host 提速到 ~0.2s，因其复杂度（spool/基线/存活探测三层事故
+  修复）与「最精简」目标冲突，v1.4.0 移除；点击聚焦的睡眠削减保留
+  （点击到置前 ~150–250ms）。
 - **应用完全退出**（宿主随之停止）→ 无通知。GUI 关闭也要收通知的场景，
   请用 web profile 的 dsh-sysnotify（其宿主独立于浏览器存活）。
 - **通知归组为 Windows PowerShell**（非 DSH 应用）——桌面端未设置 AUMID

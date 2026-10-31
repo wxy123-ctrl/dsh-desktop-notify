@@ -1,17 +1,15 @@
-﻿# toast-notify.ps1 v1.2.0 — 弹一条 Windows 系统通知；点击气泡跳回 DSH 桌面端对应会话
+﻿# toast-notify.ps1 v1.4.0 — 弹一条 Windows 系统通知；点击气泡跳回 DSH 桌面端对应会话
 # 用法（宿主 index.js 明文 -File 调用；⚠️ 绝不改用 -WindowStyle Hidden +
 # -EncodedCommand 隐藏执行——火绒等安全软件的「隐藏执行 PowerShell」规则会
 # 误杀，dsh-sysnotify v1.1.0 实测）：
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass -File toast-notify.ps1 `
 #     -Title "标题" -Body "正文" -SessionId <sid> -ClickToken <uuid> -ClickUrl <url>
-# 通知进程两版通用（脚本只用公共语法）：默认 powershell.exe（每台 Windows
-# 必有）；宿主 config.shell 'pwsh'/'auto' 时以同参数调 pwsh.exe（PowerShell
-# 7），找不到/起不来自动回落 5.1——两个 exe 行为等价，仅启动速度略有差异。
+# 通知进程固定 powershell.exe（5.1，每台 Windows 必有）；v1.4.0 已移除
+# pwsh 选择机制（探测不可靠 + 功能等价收益为零，见 README 已知边界）。
 #
 # ⚠️ 本文件必须保持 UTF-8 with BOM：无 BOM 的 UTF-8 会被 Windows PowerShell
 # 5.1 按 ANSI/GBK 误读，中文注释乱码破坏 param() 解析，脚本以退出码 1 静默
-# 失败（dsh-sysnotify v1.1.1 实测）。pwsh 7 默认 UTF-8 虽无需 BOM，但完全
-# 兼容 BOM——为 5.1 回落路径保留。selftest 有 BOM 断言防回归。
+# 失败（dsh-sysnotify v1.1.1 实测）。selftest 有 BOM 断言防回归。
 #
 # 正文换行经 U+2028（行分隔符）载体传递——命令行参数不能直接携带换行符，
 # 宿主侧把 '\n' 替换为 U+2028 后传入，这里还原。

@@ -25,20 +25,12 @@
 //      openSession 接线、长轮询免 setTimeout 续轮、样式原子化。
 //  11. toast-notify.ps1 静态断言：存在、UTF-8 BOM（EF BB BF——无 BOM 被
 //      PS 5.1 按 GBK 误读、param 崩、静默失败）、按进程名聚焦、无隐藏执行。
-//  12. pickShell 单测（注入假 probe/liveness）：pwsh 找到 → 绝对路径；
-//      未找到 / 存活探针失败（Store 别名失效）→ 回落 powershell.exe（via
-//      判据）；config 缺席与非法值 → 默认；shellText 诊断文案。
-//  13. warm host（v1.3.0）：spool 投递（1 行 JSONL 带 id/token）+ 防抖不写
-//      + 死亡回落逐次 spawn + 超 200 行裁剪末 20；toast-host.ps1 静态断言
-//      （BOM/无隐藏执行/PID 自查/150ms 轮询/基线不回放）。
+//  12. v1.4.0 精简判据：通知进程固定 powershell.exe，shell 选择与 warm host
+//      机制零残留。
 // 运行：node D:\TS\dsh-desktop-notify\selftest.mjs
-import { apply as pluginApply, findPwsh, isSubagentSession, loadPrefs, pickShell, pwshProbeReport, savePrefs, shellText, spoolAppend, testHooks } from './index.js'
-// 全程抑制真实 warm host 拉起（apply 的 webServer 注入回调也会触发
-// startWarmHost；selftest 不得启动常驻进程）。warm 通道用 setWarmAlive
-// 强制状态 + tmp spool 验证。
-testHooks.suppressWarmSpawn = true
+import { apply as pluginApply, isSubagentSession, loadPrefs, savePrefs, testHooks } from './index.js'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -163,64 +155,19 @@ try {
   ok(/window\.focus\(\)/.test(clientSrc), '点击路径附带 window.focus() 兜底')
   ok(/new Notification\(/.test(clientSrc), 'renderer 模式保留 new Notification() 路径')
   ok(/tag: 'dshdn:'/.test(clientSrc), '渲染器通知 tag 按会话复用')
-  ok(clientSrc.includes('v1.3.1 事件长轮询已启动'), '控制台横幅版本 v1.3.1（版本判据）')
+  ok(clientSrc.includes('v1.4.0 事件长轮询已启动'), '控制台横幅版本 v1.4.0（版本判据）')
   ok(/continue \/\/ 立即续轮/.test(clientSrc), '成功响应在 fetch 链内立即续轮（后台窗口不被节流）')
   ok(!/installStyles\s*\(/.test(clientSrc), '无 installStyles（不经 head 注入）')
   ok(/h\(['"]style['"]/.test(clientSrc), '组件随行渲染 <style>（伪类规则与按钮同一 commit）')
   ok(/style:\s*\{/.test(clientSrc), '按钮带内联 style 对象（静态外观不依赖样式表）')
   ok(/!important/.test(clientSrc), 'hover 背景带 !important（压过内联 background）')
 
-  // ══ pickShell 单测（config.shell 解析：pwsh 探测与 5.1 回落）══════════
-  console.log('—— pickShell：shell 解析与回落 ——')
-  ok(pickShell(undefined).shell === 'powershell.exe' && pickShell(undefined).via === 'default',
-    'config 缺席 → 默认 powershell.exe（via=default，市场分发零依赖）')
-  ok(pickShell('powershell').via === 'default' && pickShell('bogus').via === 'default',
-    "'powershell' 与非法值 → 默认 powershell.exe")
-  const pwshPath = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
-  const hit = pickShell('pwsh', () => pwshPath, () => true)
-  ok(hit.shell === pwshPath && hit.via === 'pwsh', 'shell=pwsh 且探测成功 → pwsh 绝对路径（via=pwsh）')
-  ok(pickShell('auto', () => 'C:\\pwsh.exe', () => true).via === 'pwsh', 'shell=auto 同样取 pwsh')
-  const miss = pickShell('pwsh', () => null)
-  ok(miss.via === 'pwsh-not-found' && miss.shell === 'powershell.exe',
-    'pwsh 未找到 → 回落 powershell.exe（via=pwsh-not-found）')
-  let livenessCalls = 0
-  ok(pickShell('auto', () => null, () => { livenessCalls++; return true }).via === 'pwsh-not-found'
-      && livenessCalls === 0,
-    '未找到时不再做存活探针（省一次 spawn）')
-  ok(pickShell('pwsh', () => 'C:\\pwsh.exe', () => false).via === 'pwsh-probe-failed',
-    'pwsh 存活探针失败（Store 别名失效）→ 回落（via=pwsh-probe-failed）')
-  ok(pickShell('pwsh', () => '').via === 'pwsh-not-found', 'probe 返回空串 → 视为未找到')
-  ok(shellText({ shell: 'C:\\p\\pwsh.exe', via: 'pwsh' }) === 'pwsh @ C:\\p\\pwsh.exe',
-    'shellText：pwsh 绝对路径入诊断行')
-  ok(shellText({ shell: 'powershell.exe', via: 'pwsh-not-found' }).includes('回落')
-      && shellText({ shell: 'powershell.exe', via: 'pwsh-probe-failed' }).includes('回落')
-      && shellText({ shell: 'powershell.exe', via: 'default' }) === 'powershell.exe',
-    'shellText：回落文案与默认文案')
-  // findPwsh 顺序：显式路径优先于 where.exe。候选路径与 localAppDir() 同源
-  // （LOCALAPPDATA 缺失时用 homedir 拼兜底——宿主 env 可能被剥）。
-  const localApp = process.env.LOCALAPPDATA || homedir() + '\\AppData\\Local'
-  const storePath = localApp + '\\Microsoft\\WindowsApps\\pwsh.exe'
-  const msiPath = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
-  ok(findPwsh(() => false, () => null) === null, 'findPwsh：全部候选缺失 → null')
-  ok(findPwsh((p) => p === storePath, () => msiPath) === storePath,
-    'findPwsh：Store 别名存在 → 优先返回（不看 where）')
-  ok(findPwsh((p) => p === msiPath, () => null) === msiPath, 'findPwsh：仅 MSI 存在 → MSI 路径')
-  ok(findPwsh((p) => p === 'C:\\bin\\pwsh.exe', () => 'C:\\bin\\pwsh.exe') === 'C:\\bin\\pwsh.exe',
-    'findPwsh：显式路径全缺 → where.exe 兜底命中')
-  ok(findPwsh((p) => p === msiPath, () => null) !== 'C:\\Program Files\\PowerShell\\7-preview\\pwsh.exe',
-    'findPwsh：正式版 MSI 优先于 preview')
-  ok(hostSrc.includes('spawn(toastShell'), 'toast() 的 spawn 目标来自 pickShell 解析结果')
-  ok(hostSrc.includes('v1.3.1'), '宿主加载诊断行版本 v1.3.1（版本判据）')
-
-  // ══ v1.3.1 修复判据（2026-11-01 ✅Greeting 事故三根因）══════════════
-  console.log('—— v1.3.1 修复判据 ——')
-  ok(hostSrc.includes('lstatSync'), '存在性检查用 lstat 语义（existsSync 对 Store 别名 EACCES 误杀——v1.2.0 起未找到的真凶）')
-  const probeKeys = pwshProbeReport(() => false, () => null)
-  ok(['localapp', 'alias', 'msi', 'msiPreview', 'where'].every((k) => k in probeKeys),
-    'pwshProbeReport 候选判定摘要字段齐全（失败时入日志，不再猜）')
-  ok(hostSrc.includes('疑似死亡'), '投递前 pid 实查（warm host 静默死亡自动回落逐次 spawn）')
-  ok(hostSrc.includes('pid='), 'warm host 启动行带 pid（排障对账用）')
-
+  // ══ v1.4.0 精简判据（shell 选择与 warm host 已移除）══════════════
+  console.log('—— v1.4.0 精简判据 ——')
+  ok(hostSrc.includes("spawn('powershell.exe', args"), 'toast() 固定 spawn powershell.exe（5.1）')
+  ok(!/pickShell|findPwsh|pwshAlive|warmHost|startWarmHost|spoolAppend/.test(hostSrc.replace(/^\/\/.*$/gm, '')),
+    'shell/warm 机制零残留（注释行除外）')
+  ok(hostSrc.includes('v1.4.0'), '宿主加载诊断行版本 v1.4.0（版本判据）')
   // ══ isSubagentSession 单测（子代理判定的权威信号）════════════════════
   console.log('—— isSubagentSession：子代理判定 ——')
   ok(isSubagentSession({ header: { parentSession: 'p', delegationDepth: 1 } }), 'delegationDepth ≥ 1 → 子代理')
@@ -230,24 +177,6 @@ try {
   ok(isSubagentSession({ header: { delegationDepth: '2' } }), '字符串深度容忍（持久化层宽松读取）')
   ok(!isSubagentSession({ header: { delegationDepth: 0, parentSession: '' } }), '深度 0 + 空 parent → 主会话')
 
-  // ══ toast-host.ps1 静态断言（常驻气泡进程，v1.3.0）════════════════
-  console.log('—— toast-host.ps1：常驻气泡进程静态断言 ——')
-  const hostPsBytes = readFileSync(fileURLToPath(new URL('./toast-host.ps1', import.meta.url)))
-  ok(hostPsBytes.length > 3 && hostPsBytes[0] === 0xef && hostPsBytes[1] === 0xbb && hostPsBytes[2] === 0xbf,
-    'toast-host.ps1 带 UTF-8 BOM（回落 5.1 时必需）')
-  const hostPsSrc = hostPsBytes.toString('utf8')
-  const hostPsCode = hostPsSrc.split('\n').filter((l) => !l.trimStart().startsWith('#')).join('\n')
-  ok(!hostPsCode.includes('-WindowStyle Hidden') && !hostPsCode.includes('-EncodedCommand'),
-    'toast-host.ps1 代码无隐藏执行特征（火绒纪律；注释引用除外）')
-  ok(hostPsSrc.includes('Get-Process -Id $ParentPid'), 'warm host 自查宿主 PID（宿主退出即退场）')
-  ok(hostPsSrc.includes('$timer.Interval = 150'), 'warm host 150ms UI 线程轮询')
-  ok(hostPsSrc.includes('baseline'), 'warm host 基线机制存在（不回放历史通知）')
-  ok(hostPsSrc.includes('基线直接成立'), '空文件分支置位 baseline——宿主重启后首条通知被吞的修复判据')
-  ok(hostPsSrc.includes('ConvertFrom-Json'), 'warm host 解析 JSONL spool')
-  ok(hostSrc.includes('WARM_RESPAWN_MS'), '宿主侧 warm 重启限流（30s）')
-  ok(hostSrc.includes("writeFileSync(warmSpoolPath, '', 'utf8')"), 'apply 截断 spool（宿主重启 id 归零的配套）')
-  ok(hostSrc.includes('toast spool→warm host'), 'spool 投递诊断行存在')
-  ok(hostSrc.includes('suppressWarmSpawn'), 'warm 拉起可被 selftest 抑制（防真实进程）')
 } catch (err) {
   console.error('FAIL: apply() 抛出异常:', err.stack)
   process.exit(1)
@@ -720,51 +649,6 @@ const run = async () => {
   fire(C.listeners, 'agent/status', { agent: childAgent, status: 'idle' })
   ok(toasts === subOff0 + 1, 'muteSubagents:false → 子代理完成通知恢复（+1）')
 
-  // ══ warm host spool 通道（第四实例，v1.3.0）════════════════════════
-  console.log('—— warm host：spool 投递与回落 ——')
-  const D = makeFakeCtx()
-  const tmpSpool = join(tmpPrefsDir, 'warm-spool.jsonl')
-  pluginApply(D.ctx, { prefsPath: join(tmpPrefsDir, 'd-prefs.json'), spoolPath: tmpSpool })
-  ok(testHooks.warmState().enabled === true, '默认配置启用 warm host（powershell 投递）')
-  ok(testHooks.warmState().spool === tmpSpool, 'spoolPath 配置覆盖生效')
-  testHooks.setWarmAlive(true)
-  testHooks.spawnToast = realSpawnToast // 临时解除拦截：走真实投递单点
-  ok(testHooks.notify('done', 'session-warm-1', '✅ warm 通道', '任务：spool 投递') === true,
-    'warm 存活时 notify → true')
-  testHooks.spawnToast = interceptedSpawnToast // 还原拦截
-  const spoolLines1 = readFileSync(tmpSpool, 'utf8').split('\n').filter((l) => l !== '')
-  ok(spoolLines1.length === 1, 'spool 恰好 1 行（warm 存活 → 不逐次 spawn）')
-  const warmRec = JSON.parse(spoolLines1[0])
-  ok(warmRec.sid === 'session-warm-1' && warmRec.title === '✅ warm 通道' && warmRec.id >= 1
-      && typeof warmRec.token === 'string' && warmRec.token !== '',
-    'spool 记录带 id/title/sid/token')
-  ok(logText().includes('toast spool→warm host'), 'spool 投递写诊断行')
-  testHooks.spawnToast = realSpawnToast
-  ok(testHooks.notify('done', 'session-warm-1', '✅ warm 通道', '重复') === false,
-    '同类同会话 2.5s 防抖 → false')
-  testHooks.spawnToast = interceptedSpawnToast
-  ok(readFileSync(tmpSpool, 'utf8').split('\n').filter((l) => l !== '').length === 1,
-    '防抖命中不写 spool')
-  // warm 死亡 + scriptPath 覆盖 → 绕过 warm 走旧逐次 spawn（不真实拉起）
-  testHooks.setWarmAlive(false)
-  testHooks.scriptPath = psExit0
-  const warmOff0 = toasts
-  testHooks.spawnToast = realSpawnToast
-  realSpawnToast('warm 回退', '走逐次 spawn', 'session-warm-2')
-  testHooks.spawnToast = interceptedSpawnToast
-  ok(toasts === warmOff0, 'warm 死亡 + scriptPath 覆盖 → 绕过 warm 走旧路径')
-  testHooks.scriptPath = undefined
-  // spool 裁剪：灌 205 行 → 首次超 200 时重写保留末 20，其后继续追加
-  let appendOk = 0
-  for (let i = 0; i < 205; i++) if (spoolAppend({ id: 1000 + i, title: 't' + i, body: 'b', sid: 's', token: '', ts: 0 })) appendOk++
-  const spoolFinal = readFileSync(tmpSpool, 'utf8')
-  const finalLines = spoolFinal.split('\n').filter((l) => l !== '')
-  ok(appendOk === 205, '205 次追加全部成功')
-  ok(finalLines.length === 25, 'spool 超 200 行 → 裁剪（1 初始 + 205 灌入 → 末 20 + 其后 5）')
-  ok(spoolFinal.includes('"id":1204') && spoolFinal.includes('"title":"t204"')
-      && !spoolFinal.includes('"title":"t100"'),
-    '裁剪保留的是最新记录（最旧已被丢弃）')
-
   // 收尾断言
   if (getTitleCalls === 0) fail('sessionTitle.get() 从未被调用——标题读取路径失效（误用了幻影 API？）')
   if (toasts === 0) fail('拦截计数为 0——通知链路整体失效')
@@ -779,5 +663,5 @@ run()
       console.error(`\n${failures} 处失败`)
       process.exit(1)
     }
-    console.log('\n全部自测通过 ✅（waterfall + 标题 + 全负载 + 偏好/路由/守卫(无-Origin 放行) + PS 投递/防抖/静音 + 点击长轮询/断连/容量 + notify-click 双通道去重 + 退出码端到端 + renderer 模式 + 子代理默认静音/恢复 + ⏰ 提醒 + warm host spool/回落/裁剪 + PS BOM/进程聚焦 + shell 选择/回落 + client 分发/守卫/样式）')
+    console.log('\n全部自测通过 ✅（waterfall + 标题 + 全负载 + 偏好/路由/守卫(无-Origin 放行) + PS 投递/防抖/静音 + 点击长轮询/断连/容量 + notify-click 双通道去重 + 退出码端到端 + renderer 模式 + 子代理默认静音/恢复 + ⏰ 提醒 + PS BOM/进程聚焦 + v1.4.0 精简判据 + client 分发/守卫/样式）')
   })
